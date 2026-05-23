@@ -13,5 +13,6 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
 esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy"] }
+heapless = "0.9"
 log = "0.4"
 ssd1306 = "0.10.0"

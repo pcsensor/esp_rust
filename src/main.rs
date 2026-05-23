@@ -2,14 +2,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
-use embassy_time::{Duration, Timer};
-use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_6X10},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
-};
+use esp32s3_n16r8_rust::{AppError, AppResult, Display, TaskName, display_task, heartbeat_task};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -19,41 +12,24 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println::{logger::init_logger_from_env, println};
-use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const OLED_SDA_PIN: u8 = 5;
 const OLED_SCL_PIN: u8 = 4;
 
-static HEARTBEAT_SIGNAL: Signal<CriticalSectionRawMutex, Heartbeat> = Signal::new();
-
-#[derive(Clone, Copy)]
-struct Heartbeat {
-    sequence: u32,
-}
-
-#[embassy_executor::task]
-async fn heartbeat_task() {
-    let mut sequence = 0;
-
-    loop {
-        sequence += 1;
-        HEARTBEAT_SIGNAL.signal(Heartbeat { sequence });
-        Timer::after(Duration::from_secs(1)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn serial_log_task() {
-    loop {
-        let heartbeat = HEARTBEAT_SIGNAL.wait().await;
-        log::info!("serial task received heartbeat #{}\n", heartbeat.sequence);
-    }
-}
-
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    if let Err(error) = run(spawner).await {
+        panic_on_fatal_error(error);
+    }
+
+    loop {
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
+    }
+}
+
+async fn run(spawner: Spawner) -> AppResult<()> {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -72,40 +48,36 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.I2C0,
         I2cConfig::default().with_frequency(Rate::from_khz(400)),
     )
-    .expect("failed to initialize I2C0")
+    .map_err(|source| AppError::I2cInit {
+        bus: "I2C0",
+        source,
+    })?
     .with_sda(peripherals.GPIO5)
     .with_scl(peripherals.GPIO4);
 
-    let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
+    let display = Display::new(i2c)?;
 
-    display.init().expect("failed to initialize SSD1306");
-    display
-        .clear(BinaryColor::Off)
-        .expect("failed to clear OLED");
+    let heartbeat = heartbeat_task().map_err(|source| AppError::TaskSpawn {
+        task: TaskName::Heartbeat,
+        source,
+    })?;
+    spawner.spawn(heartbeat);
 
-    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    Text::with_baseline("ESP32-S3", Point::new(0, 0), text_style, Baseline::Top)
-        .draw(&mut display)
-        .expect("failed to draw title");
-    Text::with_baseline("SSD1306 OLED", Point::new(0, 16), text_style, Baseline::Top)
-        .draw(&mut display)
-        .expect("failed to draw OLED line");
-    Text::with_baseline(
-        "Rust + esp-hal",
-        Point::new(0, 32),
-        text_style,
-        Baseline::Top,
-    )
-    .draw(&mut display)
-    .expect("failed to draw HAL line");
-    display.flush().expect("failed to flush OLED");
+    let display = display_task(display).map_err(|source| AppError::TaskSpawn {
+        task: TaskName::Display,
+        source,
+    })?;
+    spawner.spawn(display);
 
-    spawner.spawn(heartbeat_task().expect("failed to create heartbeat task"));
-    spawner.spawn(serial_log_task().expect("failed to create serial log task"));
+    log::info!("application tasks started");
 
     loop {
-        Timer::after(Duration::from_secs(60)).await;
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
     }
+}
+
+fn panic_on_fatal_error(error: AppError) -> ! {
+    log::error!("fatal application error: {}", error);
+    println!("FATAL application error: {}", error);
+    panic!("fatal application error: {}", error);
 }
