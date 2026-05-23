@@ -172,6 +172,73 @@ espflash flash --monitor
 espflash flash --monitor --port /dev/ttyACM0 target/xtensa-esp32s3-none-elf/release/esp32s3-n16r8-rust
 ```
 
+## VSCode / rust-analyzer 兼容性说明
+
+某些较新的 `rust-analyzer` 版本在打开本项目时，可能会出现类似下面的日志：
+
+```text
+`cargo metadata` failed
+error: unexpected argument '--lockfile-path' found
+```
+
+### 问题成因
+
+- 本项目通过 `rust-toolchain.toml` 固定使用 `esp` 工具链。
+- `rust-analyzer` 在分析项目时会调用 `cargo metadata`。
+- 某些新版 `rust-analyzer` 会附带 `--lockfile-path` 参数。
+- 但 Espressif 提供的 `esp` 工具链中的 Cargo 并不支持这个参数。
+- 结果就是 IDE 日志里持续出现 warning，并且可能退化为 `--no-deps` 模式，影响依赖解析、跳转和补全体验。
+
+### 解决方案：使用稍旧的 rust-analyzer
+
+推荐安装一个较早、与当前 ESP 工具链兼容性更好的 `rust-analyzer`，例如：
+
+```sh
+rustup toolchain install nightly-2026-05-04-aarch64-apple-darwin --component rust-analyzer
+```
+
+如果希望使用更通用的写法，也可以：
+
+```sh
+rustup toolchain install nightly-2026-05-04 --component rust-analyzer
+```
+
+安装后查询实际二进制路径：
+
+```sh
+rustup which rust-analyzer --toolchain nightly-2026-05-04-aarch64-apple-darwin
+```
+
+然后在项目的 `.vscode/settings.json` 中指定这个旧版 `rust-analyzer`：
+
+```json
+{
+    "rust-analyzer.server.path": "/path/to/rust-analyzer",
+    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
+    "rust-analyzer.check.allTargets": false
+}
+```
+
+本项目当前可用示例：
+
+```json
+{
+    "rust-analyzer.server.path": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/bin/rust-analyzer",
+    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
+    "rust-analyzer.check.allTargets": false
+}
+```
+
+修改后请在 VSCode 中执行：
+
+1. `Cmd + Shift + P`
+2. `Rust Analyzer: Restart Server`
+
+如果 warning 仍未消失，再执行一次：
+
+1. `Cmd + Shift + P`
+2. `Developer: Reload Window`
+
 ## 串口排查
 
 如果烧录失败：

@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.server.path": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/bin/rust-analyzer",
+    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
+    "rust-analyzer.check.allTargets": false
+}

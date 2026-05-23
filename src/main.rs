@@ -19,7 +19,8 @@ async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let software_interrupt 
+        = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
 
     init_logger_from_env();
