@@ -2,7 +2,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use esp32s3_n16r8_rust::{AppError, AppResult, Display, TaskName, display_task, heartbeat_task};
+use esp32c3_rust::{AppError, AppResult, Display, TaskName, display_task, heartbeat_task};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -38,7 +38,7 @@ async fn run(spawner: Spawner) -> AppResult<()> {
     esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
 
     init_logger_from_env();
-    println!("Hello world from ESP32-S3 N16R8!");
+    println!("Hello world from ESP32-C3!");
     println!(
         "Initializing SSD1306 OLED over I2C: SDA=GPIO{}, SCL=GPIO{}",
         OLED_SDA_PIN, OLED_SCL_PIN

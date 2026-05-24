@@ -198,7 +198,7 @@ pub async fn display_task(mut display: Display<'static>) {
 
         log::info!("{}", msg);
 
-        if let Err(error) = display.show_message("ESP32-S3", "SSD1306 OLED", &msg) {
+        if let Err(error) = display.show_message("ESP32-C3", "SSD1306 OLED", &msg) {
             log::error!("recoverable runtime error: {}", error);
         }
     }

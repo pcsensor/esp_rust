@@ -1,8 +1,8 @@
 [build]
-target = "xtensa-esp32s3-none-elf"
+target = "riscv32imc-unknown-none-elf"
 
-[target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor"
+[target.riscv32imc-unknown-none-elf]
+runner = "probe-rs run --chip ESP32-C3"
 
 [unstable]
 build-std = ["core"]

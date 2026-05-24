@@ -1,231 +1,154 @@
-# ESP32-S3 N16R8 Rust Hello World
+# ESP32-C3 Rust Hello World
 
-第一阶段目标：搭建 ESP32-S3 N16R8 的 `esp-hal` + Embassy 项目骨架，并跑通 `hello world`。
+第一阶段目标：搭建 ESP32-C3 的 `esp-hal` + Embassy 项目骨架，并跑通 `hello world`。
 
 ## 当前技术线
 
-- 芯片：ESP32-S3 N16R8
-- Rust target：`xtensa-esp32s3-none-elf`
+- 芯片：ESP32-C3
+- Rust target：`riscv32imc-unknown-none-elf`
+- 工具链：官方 Rust nightly（RISC-V 原生支持，无需 Xtensa 定制工具链）
 - HAL：`esp-hal`
 - Async runtime：`esp-rtos` 的 Embassy 集成
 - 串口输出：`esp-println`
 - panic/backtrace：`esp-backtrace`
+- 烧录：默认 `probe-rs`（支持调试）；可选 `espflash`
 
 ## 环境准备
 
-当前项目需要 ESP Rust Xtensa 工具链。项目根目录的 `rust-toolchain.toml` 指定了自定义 `esp` toolchain：
+ESP32-C3 采用 RISC-V 架构，`riscv32imc-unknown-none-elf` 是 Rust 官方原生支持的 target。因此**无需**安装 Espressif 定制的 Xtensa `esp` 工具链，直接使用官方 Rust 工具链即可。
+
+项目根目录的 `rust-toolchain.toml` 已固定编译器版本：
 
 ```toml
 [toolchain]
-channel = "esp"
+channel = "nightly-2026-05-04"
 components = ["rust-src"]
 ```
 
-如果本机还没有安装 `esp` toolchain，直接在项目目录执行 `cargo check` 会失败：
-
-```text
-error: custom toolchain 'esp' specified in override file '.../rust-toolchain.toml' is not installed
-```
-
-本机环境安装过程如下。
-
-### 1. 安装 espup
-
-因为项目目录已经指定 `esp` toolchain，而此时该 toolchain 尚未安装，所以安装全局工具时需要显式使用 stable toolchain：
+### 1. 安装工具链
 
 ```sh
-RUSTUP_TOOLCHAIN=stable cargo install espup --locked
+rustup toolchain install nightly-2026-05-04 --component rust-src
+rustup component add rust-analyzer --toolchain nightly-2026-05-04-aarch64-apple-darwin
 ```
 
-本次安装版本：
+> 本项目启用了 `build-std = ["core"]`，因此必须安装 `rust-src`。
 
-```text
-espup v0.17.1
-```
-
-### 2. 安装 ESP Rust Xtensa 工具链
-
-执行：
-
-```sh
-espup install
-```
-
-本次安装内容包括：
-
-- Xtensa Rust 1.95.0.0 toolchain
-- `rust-src` component
-- `xtensa-esp-elf` GCC
-- Xtensa LLVM
-- RISC-V Rust targets for stable toolchain
-
-安装成功后，`espup` 会生成环境变量导出脚本：
-
-```sh
-/Users/pcsensor/export-esp.sh
-```
-
-每次打开新终端后，进入本项目开发前需要加载：
-
-```sh
-. "$HOME/export-esp.sh"
-```
-
-确认 `esp` toolchain 已安装：
+确认工具链：
 
 ```sh
 rustup toolchain list
 ```
 
-应能看到类似输出：
+应能看到：
 
 ```text
 stable-aarch64-apple-darwin (default)
-esp (active)
+nightly-2026-05-04-aarch64-apple-darwin
 ```
 
-### 3. 安装 espflash
+### 2. 安装 probe-rs
 
-烧录和串口 monitor 使用 `espflash`。同样建议显式使用 stable toolchain 安装：
+日常烧录、串口 monitor 和**断点调试**使用 `probe-rs`：
 
 ```sh
-RUSTUP_TOOLCHAIN=stable cargo install espflash --locked
+cargo install probe-rs-tools --locked
 ```
 
-本次安装版本：
+验证版本：
+
+```sh
+probe-rs --version
+```
+
+ESP32-C3 内置 **USB-Serial-JTAG** 控制器，直接通过 USB 连接即可被 `probe-rs` 识别为调试器，无需额外硬件。
+
+更多用法见 [probe-rs 文档](https://probe.rs/docs/tools/probe-rs/)。
+
+### 3. （可选）安装 espflash
+
+如果只需要快速烧录和查看日志，也可使用 `espflash`：
+
+```sh
+cargo install espflash --locked
+```
+
+验证版本：
 
 ```sh
 espflash --version
 ```
 
-```text
-espflash 4.4.0
-```
-
 ### 4. 验证项目构建
 
-加载 ESP 环境变量后执行：
-
 ```sh
-. "$HOME/export-esp.sh"
-cargo check
-```
-
-`esp-hal` 会提示建议使用 release profile。推荐继续验证 release profile：
-
-```sh
-. "$HOME/export-esp.sh"
 cargo check --release
 cargo build --release
-```
-
-本机已验证：
-
-```text
-cargo check --release
-Finished `release` profile [optimized] target(s)
-
-cargo build --release
-Finished `release` profile [optimized] target(s)
 ```
 
 生成的 ELF 路径：
 
 ```sh
-target/xtensa-esp32s3-none-elf/release/esp32s3-n16r8-rust
+target/riscv32imc-unknown-none-elf/release/esp32c3-rust
 ```
 
 ## 构建与烧录
 
-每次打开新终端后先加载 ESP 工具链环境：
+### 使用 probe-rs（默认）
 
-```sh
-. "$HOME/export-esp.sh"
+`.cargo/config.toml` 已设置默认 runner：
+
+```toml
+[target.riscv32imc-unknown-none-elf]
+runner = "probe-rs run --chip ESP32-C3"
 ```
 
+直接运行：
+
 ```sh
-cargo check
 cargo run --release
 ```
 
-也可以直接使用项目脚本，它会自动加载 ESP 工具链环境：
+等效于：
+
+```sh
+probe-rs run --chip ESP32-C3 target/riscv32imc-unknown-none-elf/release/esp32c3-rust
+```
+
+如需指定调试器：
+
+```sh
+probe-rs run --chip ESP32-C3 --probe <VID:PID> target/riscv32imc-unknown-none-elf/release/esp32c3-rust
+```
+
+也可以使用项目脚本：
 
 ```sh
 ./scripts/run-release.sh
 ```
 
-项目脚本使用当前用户 home 下的 `export-esp.sh`：
+### 使用 espflash（备用）
+
+如需临时使用 `espflash` 运行，可覆盖 runner：
 
 ```sh
-. "$HOME/export-esp.sh"
+CARGO_TARGET_RISCV32IMC_UNKNOWN_NONE_ELF_RUNNER="espflash flash --monitor" cargo run --release
 ```
 
-`.cargo/config.toml` 已设置默认 target 和 runner，`cargo run --release` 会调用：
+或在 `.cargo/config.toml` 中将 `runner` 修改为 `espflash flash --monitor`。
 
-```sh
-espflash flash --monitor
-```
+## VSCode / rust-analyzer 配置
 
-如果有多个串口设备，直接指定端口：
+由于使用官方 Rust 工具链，`rust-analyzer` 与标准 Cargo 完全兼容，不再出现 `--lockfile-path` 等参数错误。
 
-```sh
-espflash flash --monitor --port /dev/ttyACM0 target/xtensa-esp32s3-none-elf/release/esp32s3-n16r8-rust
-```
-
-## VSCode / rust-analyzer 兼容性说明
-
-某些较新的 `rust-analyzer` 版本在打开本项目时，可能会出现类似下面的日志：
-
-```text
-`cargo metadata` failed
-error: unexpected argument '--lockfile-path' found
-```
-
-### 问题成因
-
-- 本项目通过 `rust-toolchain.toml` 固定使用 `esp` 工具链。
-- `rust-analyzer` 在分析项目时会调用 `cargo metadata`。
-- 某些新版 `rust-analyzer` 会附带 `--lockfile-path` 参数。
-- 但 Espressif 提供的 `esp` 工具链中的 Cargo 并不支持这个参数。
-- 结果就是 IDE 日志里持续出现 warning，并且可能退化为 `--no-deps` 模式，影响依赖解析、跳转和补全体验。
-
-### 解决方案：使用稍旧的 rust-analyzer
-
-推荐安装一个较早、与当前 ESP 工具链兼容性更好的 `rust-analyzer`，例如：
-
-```sh
-rustup toolchain install nightly-2026-05-04-aarch64-apple-darwin --component rust-analyzer
-```
-
-如果希望使用更通用的写法，也可以：
-
-```sh
-rustup toolchain install nightly-2026-05-04 --component rust-analyzer
-```
-
-安装后查询实际二进制路径：
-
-```sh
-rustup which rust-analyzer --toolchain nightly-2026-05-04-aarch64-apple-darwin
-```
-
-然后在项目的 `.vscode/settings.json` 中指定这个旧版 `rust-analyzer`：
-
-```json
-{
-    "rust-analyzer.server.path": "/path/to/rust-analyzer",
-    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
-    "rust-analyzer.check.allTargets": false
-}
-```
-
-本项目当前可用示例：
+项目已配置 `.vscode/settings.json`：
 
 ```json
 {
     "rust-analyzer.server.path": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/bin/rust-analyzer",
-    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
-    "rust-analyzer.check.allTargets": false
+    "rust-analyzer.cargo.target": "riscv32imc-unknown-none-elf",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.procMacro.server": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/libexec/rust-analyzer-proc-macro-srv"
 }
 ```
 
@@ -234,22 +157,33 @@ rustup which rust-analyzer --toolchain nightly-2026-05-04-aarch64-apple-darwin
 1. `Cmd + Shift + P`
 2. `Rust Analyzer: Restart Server`
 
-如果 warning 仍未消失，再执行一次：
-
-1. `Cmd + Shift + P`
-2. `Developer: Reload Window`
-
-## 串口排查
+## 串口 / 调试器排查
 
 如果烧录失败：
 
 ```sh
+# 查看串口设备
 ls -l /dev/ttyACM* /dev/ttyUSB*
+
+# 查看 probe-rs 识别的调试器
+probe-rs list
+
+# 查看当前用户权限
 groups
 ```
 
 常见处理：
 
-- 开发板未出现为串口设备：重新插拔 USB，或按住 `BOOT` 后复位进入下载模式。
-- 权限不足：把当前用户加入系统串口权限组，例如 `dialout`，然后重新登录。
-- 多个串口设备：使用 `espflash flash --monitor --port <PORT> ...` 指定端口。
+- 开发板未被识别：重新插拔 USB；对于 ESP32-C3，确保连接的是 USB 接口而非 UART 接口。
+- 权限不足：把当前用户加入系统串口权限组（如 `dialout`），然后重新登录。
+- `probe-rs` 找不到设备：使用 `probe-rs list` 查看可用调试器，并用 `--probe <VID:PID>` 指定。
+- 使用 `espflash` 时多个串口设备：使用 `espflash flash --monitor --port <PORT> ...` 指定端口。
+
+## 工具链与烧录方案对比
+
+| 方案 | 适用场景 | 优点 | 缺点 |
+|---|---|---|---|
+| **probe-rs** | 日常开发、烧录、调试 | 支持断点、单步、查看寄存器；烧录后自动 monitor；通用工具 | 对 ESP 的 JTAG 支持仍在完善 |
+| **espflash** | 仅需烧录和查看日志 | 配置简单；自动处理下载模式；monitor 输出直接 | 不支持硬件断点调试 |
+
+推荐：**默认使用 `probe-rs`**，既满足日常烧录和日志查看，也保留断点调试能力。仅需快速烧录时可使用 `espflash`。
