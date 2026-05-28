@@ -73,10 +73,9 @@ topology: sensor(3) -> relay(2) -> gateway(1)  hop=1
 
 ```text
 rx DATA via=2 temp=26.61C humidity=51.45% alarm=false gateway_time=...
-tx ACK seq=... acked_seq=... bytes=...
 ```
 
-每 10 秒 Slot 4 状态汇总：
+每 5 秒 Slot 4 状态汇总：
 
 ```text
 gateway status | uptime=...s sync_seq=... offset_ms=... alarm=false buzzer=GPIO10
@@ -125,7 +124,7 @@ relay slot active: buffered_data=... pending_ack=... parent=... hop=1 sync_seq=.
 relay slot tx buffered DATA sensor_seq=... relay_seq=... bytes=...
 ```
 
-每 10 秒 Slot 4 状态：
+每 5 秒 Slot 4 状态：
 
 ```text
 relay status | parent=Some(1) hop=1 slot=2 sync_seq=... offset_ms=...
@@ -147,7 +146,7 @@ tx DATA seq=... parent=Some(2) temp=26.61C humidity=51.45% gateway_time=... byte
 rx ACK from=2 acked_seq=... acked_type=DATA cleared_pending=true
 ```
 
-每 10 秒 Slot 4 状态：
+每 5 秒 Slot 4 状态：
 
 ```text
 sensor status | parent=Some(2) hop=2 slot=1 sync_seq=... offset_ms=...
@@ -169,4 +168,4 @@ sensor status | parent=Some(2) hop=2 slot=1 sync_seq=... offset_ms=...
 
 - 固件启动时通过 AT 命令自动关闭模块密钥（`AT+OPENKEY0`），若模块已预先配置为透明模式则此步骤无副作用。其余参数（信道、速率等级等）沿用模块出厂默认值。
 - 当前可靠传输是单帧 pending-ACK 窗口（最多重传 3 次），适合答辩 demo，不适合高吞吐。
-- TDMA slot 长度先用 2 s，现场可按 LoRa 空口延迟和串口日志调整。
+- 超帧周期 5 s，每个 slot 1 s，共 5 个 slot。现场可按 LoRa 空口延迟调整。

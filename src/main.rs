@@ -391,12 +391,16 @@ fn handle_received_frame(
                 alarm,
                 frame.gateway_time_ms
             );
-            let ack = node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
-            let bytes = lora_transport.send_frame(&ack)?;
-            println!(
-                "tx ACK seq={} acked_seq={} bytes={}",
-                ack.seq, frame.seq, bytes
-            );
+            // Only ALARM gets ACK for guaranteed delivery
+            if alarm {
+                let ack =
+                    node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
+                let bytes = lora_transport.send_frame(&ack)?;
+                println!(
+                    "tx ACK seq={} acked_seq={} bytes={}",
+                    ack.seq, frame.seq, bytes
+                );
+            }
 
             #[cfg(feature = "gateway-node")]
             {
@@ -420,11 +424,9 @@ fn handle_received_frame(
                 sync_seq,
             },
         ) => {
-            let ack = node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
-            let bytes = lora_transport.send_frame(&ack)?;
             println!(
-                "rx HEARTBEAT from={} role={} slot={} hop={} sync_seq={} -> ACK bytes={}",
-                frame.src_id, frame.node_role, slot_id, hop, sync_seq, bytes
+                "rx HEARTBEAT from={} role={} slot={} hop={} sync_seq={}",
+                frame.src_id, frame.node_role, slot_id, hop, sync_seq
             );
         }
         (NodeRole::Relay, FrameType::Hello, _) if frame.node_role == NodeRole::Sensor => {
@@ -454,11 +456,9 @@ fn handle_received_frame(
                 sync_seq,
             },
         ) => {
-            let ack = node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
-            let ack_bytes = lora_transport.send_frame(&ack)?;
             println!(
-                "rx HEARTBEAT from={} slot={} hop={} sync_seq={} -> ack_bytes={}",
-                frame.src_id, slot_id, hop, sync_seq, ack_bytes
+                "rx HEARTBEAT from={} slot={} hop={} sync_seq={}",
+                frame.src_id, slot_id, hop, sync_seq
             );
         }
         (
@@ -486,9 +486,10 @@ fn handle_received_frame(
                 alarm,
             },
         ) => {
-            let ack = node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
-            let ack_bytes = lora_transport.send_frame(&ack)?;
             if alarm {
+                let ack =
+                    node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
+                let ack_bytes = lora_transport.send_frame(&ack)?;
                 let forwarded = node.make_forwarded(frame, GATEWAY_ID, local_time_ms)?;
                 let forward_bytes = lora_transport.send_frame(&forwarded)?;
                 pending_ack.remember(&forwarded, local_time_ms);
@@ -506,13 +507,12 @@ fn handle_received_frame(
             } else {
                 relay_forward.remember(frame);
                 println!(
-                    "rx DATA from sensor={} temp={}.{:02}C humidity={}.{:02}% -> ack_bytes={} buffered_for_relay_slot=true",
+                    "rx DATA from sensor={} temp={}.{:02}C humidity={}.{:02}% -> buffered_for_relay_slot",
                     frame.src_id,
                     temp_centi_c / 100,
                     temp_centi_c.unsigned_abs() % 100,
                     humidity_centi_percent / 100,
-                    humidity_centi_percent % 100,
-                    ack_bytes
+                    humidity_centi_percent % 100
                 );
             }
         }
@@ -661,10 +661,9 @@ impl PendingAck {
 }
 
 fn is_ack_required(frame_type: FrameType) -> bool {
-    matches!(
-        frame_type,
-        FrameType::Data | FrameType::Alarm | FrameType::Heartbeat
-    )
+    // Only ALARM needs guaranteed delivery with ACK/retry.
+    // DATA and HEARTBEAT are periodic best-effort — one lost is acceptable.
+    matches!(frame_type, FrameType::Alarm)
 }
 
 #[cfg(feature = "sensor-node")]

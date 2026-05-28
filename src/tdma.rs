@@ -12,8 +12,8 @@ pub struct TdmaSchedule {
 
 impl TdmaSchedule {
     pub const DEMO: Self = Self {
-        superframe_ms: 10_000,
-        slot_ms: 2_000,
+        superframe_ms: 5_000,
+        slot_ms: 1_000,
         slot_count: 5,
         sync_slot: 0,
         sensor_slot: 1,
