@@ -238,6 +238,10 @@ async fn run() -> AppResult<()> {
                     Sht40Config::DEFAULT.temp_alarm_centi_c,
                     Sht40Config::DEFAULT.humidity_alarm_centi_percent,
                 );
+                // If alarm has cleared, stop retrying the old ALARM
+                if !alarm && pending_ack.has_pending() {
+                    pending_ack.force_clear();
+                }
                 let frame = if alarm {
                     node.make_alarm(
                         local_time_ms,
@@ -615,6 +619,12 @@ impl PendingAck {
             self.attempts = 1;
             self.last_sent_ms = now_ms;
         }
+    }
+
+    fn force_clear(&mut self) {
+        self.frame = None;
+        self.attempts = 0;
+        self.last_sent_ms = 0;
     }
 
     fn clear_if_matches(&mut self, acked_seq: u16, acked_type: FrameType) -> bool {
