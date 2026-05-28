@@ -262,6 +262,10 @@ impl DemoNode {
                 }
             }
             FrameType::Sync | FrameType::Schedule => {
+                // Gateway is the time authority — never sync to external SYNC
+                if self.role == NodeRole::Gateway {
+                    return FrameAction::Ignore;
+                }
                 if let Some((sync_seq, superframe_ms, slot_ms)) =
                     protocol::decode_sync_payload(&frame.payload)
                 {

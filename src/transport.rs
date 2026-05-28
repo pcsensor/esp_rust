@@ -108,9 +108,17 @@ impl LoraTransport for LoraUartTransport<'_> {
 /// **Important**: after this function returns the module reboots; the caller
 /// must wait ~500 ms before sending data frames.
 pub async fn configure_dx_lr32_module(uart: &mut Uart<'_, Blocking>) -> Result<(), LoraUartError> {
+    // Initial guard time — module may still be booting
+    Timer::after(Duration::from_millis(500)).await;
+
     for (i, cmd) in DX_LR32_DEMO_AT_SEQUENCE.iter().enumerate() {
         let is_enter = *cmd == "+++" && i == 0;
         let is_exit = *cmd == "+++" && i > 0;
+
+        // Guard time before +++ per DX-LR32 manual §4.1
+        if is_enter || is_exit {
+            Timer::after(Duration::from_millis(500)).await;
+        }
 
         // Each entry in DX_LR32_DEMO_AT_SEQUENCE is sent verbatim
         // (AT commands already include \r\n; +++ is sent bare)
