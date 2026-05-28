@@ -10,7 +10,7 @@ pub const HEADER_LEN: usize = 21;
 pub const CRC_LEN: usize = 2;
 pub const MAX_FRAME_LEN: usize =
     1 + 1 + 2 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 8 + 1 + MAX_PAYLOAD_LEN + CRC_LEN;
-pub const RX_BUFFER_LEN: usize = MAX_FRAME_LEN * 2;
+pub const RX_BUFFER_LEN: usize = MAX_FRAME_LEN * 6;
 
 pub type Payload = Vec<u8, MAX_PAYLOAD_LEN>;
 pub type EncodedFrame = Vec<u8, MAX_FRAME_LEN>;

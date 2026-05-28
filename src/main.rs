@@ -234,12 +234,6 @@ async fn run() -> AppResult<()> {
                 #[cfg(not(feature = "sensor-node"))]
                 let sample = read_environment_sample().await;
 
-                if pending_ack.has_pending() {
-                    println!("sensor data slot skipped: waiting for ACK before next DATA/ALARM");
-                    Timer::after(Duration::from_millis(node.schedule.slot_ms as u64)).await;
-                    continue;
-                }
-
                 let alarm = sample.is_alarm_with(
                     Sht40Config::DEFAULT.temp_alarm_centi_c,
                     Sht40Config::DEFAULT.humidity_alarm_centi_percent,
@@ -275,16 +269,14 @@ async fn run() -> AppResult<()> {
             NodeRole::Relay
                 if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
             {
-                if !pending_ack.has_pending() {
-                    if let Some(frame) = relay_forward.take() {
-                        let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
-                        let bytes = lora_transport.send_frame(&forwarded)?;
-                        pending_ack.remember(&forwarded, local_time_ms);
-                        println!(
-                            "relay slot tx buffered {} sensor_seq={} relay_seq={} bytes={}",
-                            frame.frame_type, frame.seq, forwarded.seq, bytes
-                        );
-                    }
+                if let Some(frame) = relay_forward.take() {
+                    let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
+                    let bytes = lora_transport.send_frame(&forwarded)?;
+                    pending_ack.remember(&forwarded, local_time_ms);
+                    println!(
+                        "relay slot tx buffered {} sensor_seq={} relay_seq={} bytes={}",
+                        frame.frame_type, frame.seq, forwarded.seq, bytes
+                    );
                 }
                 println!(
                     "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={}",
