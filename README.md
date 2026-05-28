@@ -2,6 +2,72 @@
 
 第一阶段目标：搭建 ESP32-C3 的 `esp-hal` + Embassy 项目骨架，并跑通 `hello world`。
 
+## 第二阶段：管廊传感网答辩 Demo
+
+当前代码已切到 `GOAL.md` 中的三节点 demo 工程骨架。三种固件角色通过 Cargo feature 选择，同一时间只能启用一个角色：
+
+```sh
+cargo check --release --no-default-features --features gateway-node
+cargo check --release --no-default-features --features relay-node
+cargo check --release --no-default-features --features sensor-node
+```
+
+默认 feature 是 `gateway-node`，所以 `cargo run --release` 会构建网关节点。
+
+烧录某个角色时使用同样的 feature：
+
+```sh
+cargo run --release --no-default-features --features gateway-node
+cargo run --release --no-default-features --features relay-node
+cargo run --release --no-default-features --features sensor-node
+```
+
+也可以使用脚本：
+
+```sh
+./scripts/run-release.sh gateway
+./scripts/run-release.sh relay
+./scripts/run-release.sh sensor
+```
+
+完整检查当前 demo 构建：
+
+```sh
+./scripts/check-demo.sh
+```
+
+默认演示接线先按代码中的集中配置记录，实际接线确认后再调整：
+
+| 模块 | 默认 GPIO | 说明 |
+|---|---:|---|
+| DX-LR32 UART TX | GPIO21 | ESP32-C3 UART1 TX，接 LoRa 模块 RX |
+| DX-LR32 UART RX | GPIO20 | ESP32-C3 UART1 RX，接 LoRa 模块 TX |
+| SHT40 SDA | GPIO5 | 仅传感节点使用 |
+| SHT40 SCL | GPIO4 | 仅传感节点使用 |
+| 有源蜂鸣器 | GPIO10 | 仅网关节点使用，低电平响 |
+
+LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433 MHz、channel 23、空中速率 2400 bps、发射功率 22 dBm、NetID `0x4331`。当前代码启动时会打印这组参数；模块仍按 `manual-before-boot` 处理，也就是先用模块工具或手册命令配置好，再运行固件。运行时写配置命令要等 `docs/DX-LR32-433T22D模组_串口UART_应用指导.pdf` 的命令格式和模块模式脚确认后再打开。
+
+当前已实现的工程代码：
+
+- 统一 LoRa 帧格式：`HELLO`、`JOIN_ACK`、`SYNC/SCHEDULE`、`DATA`、`ALARM`、`ACK`、`HEARTBEAT`，带 CRC16。
+- 三节点固定演示拓扑：网关只接纳中继节点入网，中继只接纳传感节点入网，保证答辩时稳定展示 `sensor -> relay -> gateway`。
+- 简化 TDMA 参数：10 s 超帧、5 个 2 s slot。
+- FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新。
+- DX-LR32 UART transport：通过 UART1 发送编码后的帧。
+- LoRa UART 接收轮询：主循环使用 `read_ready()` 非阻塞检查串口；transport 内部带流式组帧缓存，可处理半帧、粘包和前导噪声字节。网关/中继/传感节点会按角色处理 `HELLO`、`JOIN_ACK`、`SYNC`、`DATA`、`ALARM`、`ACK`。
+- 在线心跳与确认：已入网的中继/传感节点在维护 slot 发送 `HEARTBEAT`，上级节点返回 `ACK`；传感数据、告警和心跳的 ACK payload 会解析并打印。节点侧维护一个单帧 pending-ACK 窗口，`DATA`、`ALARM`、`HEARTBEAT` 未确认时会在维护 slot 最多重传 3 次。
+- SHT40 读取：传感节点通过 I2C0 读取温湿度，CRC8 校验失败或 I2C 失败时退回演示样本。
+- 网关蜂鸣器：GPIO10 默认高电平关闭；收到 `ALARM` 后拉低响铃，后续收到普通 `DATA` 时解除告警并关闭蜂鸣器。
+
+当前仍需继续完成的部分：
+
+- 中继转发、告警 ACK 和蜂鸣器联动已接入代码路径，仍需要三块板实测确认 DX-LR32 空口/串口时序、实际延迟和 TDMA slot 长度。
+- 可靠传输当前是 demo 级单帧窗口；如果现场需要更高吞吐，再扩展为队列和按帧类型优先级调度。
+- DX-LR32 的模块参数写入/查询命令需要按 PDF 手册和实际模块模式确认；当前代码已把配置计划集中到 `src/hardware.rs` 并在启动日志中打印，便于人工核对。
+
+现场三节点联调步骤见 [docs/demo-runbook.md](docs/demo-runbook.md)。
+
 ## 当前技术线
 
 - 芯片：ESP32-C3
@@ -124,7 +190,9 @@ probe-rs run --chip ESP32-C3 --probe <VID:PID> target/riscv32imc-unknown-none-el
 也可以使用项目脚本：
 
 ```sh
-./scripts/run-release.sh
+./scripts/run-release.sh gateway
+./scripts/run-release.sh relay
+./scripts/run-release.sh sensor
 ```
 
 ### 使用 espflash（备用）
