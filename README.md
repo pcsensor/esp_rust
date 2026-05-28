@@ -46,25 +46,40 @@ cargo run --release --no-default-features --features sensor-node
 | SHT40 SCL | GPIO4 | 仅传感节点使用 |
 | 有源蜂鸣器 | GPIO10 | 仅网关节点使用，低电平响 |
 
-LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433 MHz、channel 23、空中速率 2400 bps、发射功率 22 dBm、NetID `0x4331`。当前代码启动时会打印这组参数；模块仍按 `manual-before-boot` 处理，也就是先用模块工具或手册命令配置好，再运行固件。运行时写配置命令要等 `docs/DX-LR32-433T22D模组_串口UART_应用指导.pdf` 的命令格式和模块模式脚确认后再打开。
+LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz、channel 0、空中速率 2148 bps、发射功率 22 dBm、NetID `0x4331`。当前代码启动时会尝试进入 AT 模式发送 `AT+OPENKEY0` 关闭密钥校验；如果模块没有返回 `Entry AT`，固件会降级为沿用已有透明传输配置继续运行。
 
 当前已实现的工程代码：
 
 - 统一 LoRa 帧格式：`HELLO`、`JOIN_ACK`、`SYNC/SCHEDULE`、`DATA`、`ALARM`、`ACK`、`HEARTBEAT`，带 CRC16。
 - 三节点固定演示拓扑：网关只接纳中继节点入网，中继只接纳传感节点入网，保证答辩时稳定展示 `sensor -> relay -> gateway`。
-- 简化 TDMA 参数：10 s 超帧、5 个 2 s slot。
-- FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新。
+- 简化 TDMA 参数：8 s 超帧、8 个 1 s slot。
+- FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新；`sync_seq` 与普通 frame `seq` 分离，避免 ACK/DATA 导致同步序号跳号。
 - DX-LR32 UART transport：通过 UART1 发送编码后的帧。
 - LoRa UART 接收轮询：主循环使用 `read_ready()` 非阻塞检查串口；transport 内部带流式组帧缓存，可处理半帧、粘包和前导噪声字节。网关/中继/传感节点会按角色处理 `HELLO`、`JOIN_ACK`、`SYNC`、`DATA`、`ALARM`、`ACK`。
-- 在线心跳与确认：已入网的中继/传感节点在维护 slot 发送 `HEARTBEAT`，上级节点返回 `ACK`；传感数据、告警和心跳的 ACK payload 会解析并打印。节点侧维护一个单帧 pending-ACK 窗口，`DATA`、`ALARM`、`HEARTBEAT` 未确认时会在维护 slot 最多重传 3 次。
+- `DATA/ALARM` payload 携带 `origin_id` 和 `origin_seq`；中继转发后网关会同时打印原始传感节点序号和中继转发序号，便于判断丢包发生在哪一跳。
+- 在线心跳与确认：`DATA` 和 `HEARTBEAT` 为周期性最佳努力发送，不 ACK；`ALARM` 使用跳到跳 ACK，传感节点等中继 ACK，中继等网关 ACK，未确认时在告警重传 slot 最多重传 3 次。
 - SHT40 读取：传感节点通过 I2C0 读取温湿度，CRC8 校验失败或 I2C 失败时退回演示样本。
+- 告警回差：温度 >= 30.00 C 或湿度 >= 80.00% 触发 `ALARM`；恢复到温度 < 29.00 C 且湿度 < 75.00% 后才解除，避免蜂鸣器在阈值附近抖动。
 - 网关蜂鸣器：GPIO10 默认高电平关闭；收到 `ALARM` 后拉低响铃，后续收到普通 `DATA` 时解除告警并关闭蜂鸣器。
+
+当前 TDMA slot 分配：
+
+| Slot | 时间 | 用途 |
+|---:|---:|---|
+| 0 | 0-1 s | 网关广播 `SYNC/SCHEDULE` |
+| 1 | 1-2 s | 中继控制预留，用于同步转发/入网控制扩展 |
+| 2 | 2-3 s | 传感节点 `HELLO` 重试、SHT40 采样和 `DATA/ALARM` 首发 |
+| 3 | 3-4 s | 中继向网关转发缓存的普通 `DATA` |
+| 4 | 4-5 s | `ALARM` ACK 超时后的重传 |
+| 5 | 5-6 s | 中继 `HEARTBEAT` |
+| 6 | 6-7 s | 传感节点 `HEARTBEAT` |
+| 7 | 7-8 s | 静默/现场观察/后续配置预留 |
 
 当前仍需继续完成的部分：
 
-- 中继转发、告警 ACK 和蜂鸣器联动已接入代码路径，仍需要三块板实测确认 DX-LR32 空口/串口时序、实际延迟和 TDMA slot 长度。
-- 可靠传输当前是 demo 级单帧窗口；如果现场需要更高吞吐，再扩展为队列和按帧类型优先级调度。
-- DX-LR32 的模块参数写入/查询命令需要按 PDF 手册和实际模块模式确认；当前代码已把配置计划集中到 `src/hardware.rs` 并在启动日志中打印，便于人工核对。
+- 中继转发、告警 ACK 和蜂鸣器联动已接入代码路径，仍需要三块板实测确认 DX-LR32 空口/串口时序、实际延迟和 1 s slot 长度。
+- 可靠传输当前是 demo 级单帧 ALARM pending-ACK 窗口；如果现场需要更高吞吐，再扩展为队列和按帧类型优先级调度。
+- DX-LR32 的运行时配置只发送 `AT+OPENKEY0`，其余参数沿用默认或人工配置；当前代码已把配置计划集中到 `src/hardware.rs` 并在启动日志中打印，便于人工核对。
 
 现场三节点联调步骤见 [docs/demo-runbook.md](docs/demo-runbook.md)。
 

@@ -224,13 +224,13 @@ impl FrameStreamDecoder {
 
             if self.buffer[1] != VERSION {
                 self.discard(1);
-                return Err(StreamDecodeError::Decode(DecodeError::UnsupportedVersion));
+                continue;
             }
 
             let payload_len = self.buffer[20] as usize;
             if payload_len > MAX_PAYLOAD_LEN {
                 self.discard(1);
-                return Err(StreamDecodeError::Decode(DecodeError::PayloadTooLong));
+                continue;
             }
 
             let frame_len = HEADER_LEN + payload_len + CRC_LEN;
@@ -245,7 +245,10 @@ impl FrameStreamDecoder {
                 }
                 Err(error) => {
                     self.discard(1);
-                    return Err(StreamDecodeError::Decode(error));
+                    if matches!(error, DecodeError::TooShort) {
+                        return Ok(None);
+                    }
+                    continue;
                 }
             }
         }
@@ -323,10 +326,14 @@ pub fn sync_payload(
 }
 
 pub fn data_payload(
+    origin_id: u8,
+    origin_seq: u16,
     temp_centi_c: i16,
     humidity_centi_percent: u16,
 ) -> Result<Payload, EncodeError> {
     let mut payload = Payload::new();
+    push(&mut payload, origin_id)?;
+    extend_payload(&mut payload, &origin_seq.to_le_bytes())?;
     extend_payload(&mut payload, &temp_centi_c.to_le_bytes())?;
     extend_payload(&mut payload, &humidity_centi_percent.to_le_bytes())?;
     Ok(payload)
@@ -365,13 +372,15 @@ pub fn decode_sync_payload(payload: &[u8]) -> Option<(u16, u32, u32)> {
     ))
 }
 
-pub fn decode_data_payload(payload: &[u8]) -> Option<(i16, u16)> {
-    if payload.len() < 4 {
+pub fn decode_data_payload(payload: &[u8]) -> Option<(u8, u16, i16, u16)> {
+    if payload.len() < 7 {
         return None;
     }
     Some((
-        i16::from_le_bytes([payload[0], payload[1]]),
-        u16::from_le_bytes([payload[2], payload[3]]),
+        payload[0],
+        u16::from_le_bytes([payload[1], payload[2]]),
+        i16::from_le_bytes([payload[3], payload[4]]),
+        u16::from_le_bytes([payload[5], payload[6]]),
     ))
 }
 

@@ -4,22 +4,28 @@ pub struct TdmaSchedule {
     pub slot_ms: u32,
     pub slot_count: u8,
     pub sync_slot: u8,
+    pub relay_control_slot: u8,
     pub sensor_slot: u8,
     pub relay_slot: u8,
-    pub maintenance_slot: u8,
-    pub alarm_slot: u8,
+    pub alarm_retry_slot: u8,
+    pub relay_heartbeat_slot: u8,
+    pub sensor_heartbeat_slot: u8,
+    pub quiet_slot: u8,
 }
 
 impl TdmaSchedule {
     pub const DEMO: Self = Self {
-        superframe_ms: 5_000,
+        superframe_ms: 8_000,
         slot_ms: 1_000,
-        slot_count: 5,
+        slot_count: 8,
         sync_slot: 0,
-        sensor_slot: 1,
-        relay_slot: 2,
-        maintenance_slot: 3,
-        alarm_slot: 4,
+        relay_control_slot: 1,
+        sensor_slot: 2,
+        relay_slot: 3,
+        alarm_retry_slot: 4,
+        relay_heartbeat_slot: 5,
+        sensor_heartbeat_slot: 6,
+        quiet_slot: 7,
     };
 
     pub const fn slot_at(self, gateway_time_ms: u64) -> u8 {

@@ -52,8 +52,8 @@ impl NodeRole {
     pub const fn default_slot(self) -> u8 {
         match self {
             Self::Gateway => 0,
-            Self::Sensor => 1,
-            Self::Relay => 2,
+            Self::Sensor => 2,
+            Self::Relay => 3,
         }
     }
 

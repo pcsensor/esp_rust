@@ -115,6 +115,8 @@ pub struct Sht40Config {
     pub i2c_address: u8,
     pub temp_alarm_centi_c: i16,
     pub humidity_alarm_centi_percent: u16,
+    pub temp_clear_centi_c: i16,
+    pub humidity_clear_centi_percent: u16,
 }
 
 impl Sht40Config {
@@ -122,6 +124,8 @@ impl Sht40Config {
         i2c_address: 0x44,
         temp_alarm_centi_c: 3_000,
         humidity_alarm_centi_percent: 8_000,
+        temp_clear_centi_c: 2_900,
+        humidity_clear_centi_percent: 7_500,
     };
 }
 

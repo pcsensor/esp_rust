@@ -24,6 +24,8 @@ pub enum FrameAction {
         offset_ms: i64,
     },
     Data {
+        origin_id: u8,
+        origin_seq: u16,
         temp_centi_c: i16,
         humidity_centi_percent: u16,
         alarm: bool,
@@ -46,10 +48,12 @@ pub struct DemoNode {
     pub hop: u8,
     pub slot_id: u8,
     pub seq: u16,
+    pub sync_seq: u16,
     pub phase: NetworkPhase,
     pub sync: TimeSync,
     pub schedule: TdmaSchedule,
     last_data_seq: Option<(u8, u16)>,
+    last_heartbeat_seq: Option<(u8, u16)>,
 }
 
 impl DemoNode {
@@ -60,10 +64,12 @@ impl DemoNode {
             hop: role.default_hop(),
             slot_id: role.default_slot(),
             seq: 0,
+            sync_seq: 0,
             phase: NetworkPhase::Searching,
             sync: TimeSync::new(role.default_hop()),
             schedule: TdmaSchedule::DEMO,
             last_data_seq: None,
+            last_heartbeat_seq: None,
         }
     }
 
@@ -93,7 +99,8 @@ impl DemoNode {
     }
 
     pub fn make_sync(&mut self, local_time_ms: u64) -> AppResult<Frame> {
-        let seq = self.next_seq();
+        let frame_seq = self.next_seq();
+        self.sync_seq = self.sync_seq.wrapping_add(1);
         Ok(Frame {
             net_id: NET_ID,
             src_id: self.role.node_id(),
@@ -101,11 +108,11 @@ impl DemoNode {
             node_role: self.role,
             zone_id: DEMO_ZONE_ID,
             frame_type: FrameType::Sync,
-            seq,
+            seq: frame_seq,
             hop: self.hop,
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
             payload: protocol::sync_payload(
-                seq,
+                self.sync_seq,
                 self.schedule.superframe_ms,
                 self.schedule.slot_ms,
             )?,
@@ -152,7 +159,12 @@ impl DemoNode {
             seq,
             hop: self.hop,
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
-            payload: protocol::data_payload(temp_centi_c, humidity_centi_percent)?,
+            payload: protocol::data_payload(
+                self.role.node_id(),
+                seq,
+                temp_centi_c,
+                humidity_centi_percent,
+            )?,
         })
     }
 
@@ -173,7 +185,12 @@ impl DemoNode {
             seq,
             hop: self.hop,
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
-            payload: protocol::data_payload(temp_centi_c, humidity_centi_percent)?,
+            payload: protocol::data_payload(
+                self.role.node_id(),
+                seq,
+                temp_centi_c,
+                humidity_centi_percent,
+            )?,
         })
     }
 
@@ -290,10 +307,12 @@ impl DemoNode {
                     return FrameAction::Ignore;
                 }
                 self.last_data_seq = Some(key);
-                if let Some((temp_centi_c, humidity_centi_percent)) =
+                if let Some((origin_id, origin_seq, temp_centi_c, humidity_centi_percent)) =
                     protocol::decode_data_payload(&frame.payload)
                 {
                     FrameAction::Data {
+                        origin_id,
+                        origin_seq,
                         temp_centi_c,
                         humidity_centi_percent,
                         alarm: frame.frame_type == FrameType::Alarm,
@@ -314,6 +333,11 @@ impl DemoNode {
                 }
             }
             FrameType::Heartbeat => {
+                let key = (frame.src_id, frame.seq);
+                if self.last_heartbeat_seq == Some(key) {
+                    return FrameAction::Ignore;
+                }
+                self.last_heartbeat_seq = Some(key);
                 if let Some((slot_id, hop, sync_seq)) =
                     protocol::decode_heartbeat_payload(&frame.payload)
                 {
@@ -365,4 +389,56 @@ impl EnvironmentSample {
         self.temp_centi_c >= temp_alarm_centi_c
             || self.humidity_centi_percent >= humidity_alarm_centi_percent
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlarmLatch {
+    active: bool,
+}
+
+impl AlarmLatch {
+    pub const fn new() -> Self {
+        Self { active: false }
+    }
+
+    pub const fn is_active(self) -> bool {
+        self.active
+    }
+
+    pub fn update(
+        &mut self,
+        sample: EnvironmentSample,
+        temp_alarm_centi_c: i16,
+        humidity_alarm_centi_percent: u16,
+        temp_clear_centi_c: i16,
+        humidity_clear_centi_percent: u16,
+    ) -> AlarmTransition {
+        let previous = self.active;
+        if self.active {
+            self.active = sample.temp_centi_c >= temp_clear_centi_c
+                || sample.humidity_centi_percent >= humidity_clear_centi_percent;
+        } else {
+            self.active = sample.temp_centi_c >= temp_alarm_centi_c
+                || sample.humidity_centi_percent >= humidity_alarm_centi_percent;
+        }
+
+        match (previous, self.active) {
+            (false, true) => AlarmTransition::Raised,
+            (true, false) => AlarmTransition::Cleared,
+            _ => AlarmTransition::Unchanged,
+        }
+    }
+}
+
+impl Default for AlarmLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmTransition {
+    Unchanged,
+    Raised,
+    Cleared,
 }
