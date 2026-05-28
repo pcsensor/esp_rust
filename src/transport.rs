@@ -62,14 +62,25 @@ impl<'d> LoraUartTransport<'d> {
         self.decoder.next_frame().map_err(LoraUartError::Stream)
     }
 
-    pub fn try_read_frame(&mut self) -> Result<Option<Frame>, LoraUartError> {
-        if let Some(frame) = self.decoder.next_frame().map_err(LoraUartError::Stream)? {
-            return Ok(Some(frame));
+    /// Drain all available UART bytes into the stream decoder.
+    /// Call this once per poll cycle to avoid RX FIFO overflow.
+    pub fn drain_to_decoder(&mut self) -> Result<(), LoraUartError> {
+        let mut buffer = [0u8; MAX_FRAME_LEN];
+        while self.uart.read_ready() {
+            let read = self.uart.read(&mut buffer).map_err(LoraUartError::Rx)?;
+            if read == 0 {
+                break;
+            }
+            self.decoder
+                .push_bytes(&buffer[..read])
+                .map_err(LoraUartError::Stream)?;
         }
-        if !self.uart.read_ready() {
-            return Ok(None);
-        }
-        self.read_frame()
+        Ok(())
+    }
+
+    /// Pop one complete frame from the decoder buffer, if available.
+    pub fn next_decoded_frame(&mut self) -> Result<Option<Frame>, LoraUartError> {
+        self.decoder.next_frame().map_err(LoraUartError::Stream)
     }
 
     fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), LoraUartError> {
@@ -90,7 +101,7 @@ impl LoraTransport for LoraUartTransport<'_> {
 
     fn receive(&mut self, buffer: &[u8]) -> Result<Option<Frame>, Self::Error> {
         if buffer.is_empty() {
-            self.try_read_frame()
+            self.next_decoded_frame()
         } else {
             Frame::decode(buffer)
                 .map(Some)

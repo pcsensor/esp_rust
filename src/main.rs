@@ -141,8 +141,13 @@ async fn run() -> AppResult<()> {
             .schedule
             .slot_at(node.sync.gateway_time_ms(local_time_ms));
 
+        // Drain all UART bytes to avoid hardware FIFO overflow
+        if let Err(error) = lora_transport.drain_to_decoder() {
+            log::warn!("LoRa RX drain failed: {}", error);
+        }
+
         for _ in 0..MAX_RX_FRAMES_PER_LOOP {
-            match lora_transport.try_read_frame() {
+            match lora_transport.next_decoded_frame() {
                 Ok(Some(frame)) => {
                     handle_received_frame(
                         &mut node,
@@ -158,7 +163,7 @@ async fn run() -> AppResult<()> {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    log::warn!("LoRa RX ignored: {}", error);
+                    log::warn!("LoRa RX decode error: {}", error);
                     break;
                 }
             }
@@ -255,12 +260,14 @@ async fn run() -> AppResult<()> {
                 let bytes = lora_transport.send_frame(&frame)?;
                 pending_ack.remember(&frame, local_time_ms);
                 println!(
-                    "tx {} seq={} parent={:?} temp={}cC humidity={}c% gateway_time={} bytes={}",
+                    "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
                     frame.frame_type,
                     frame.seq,
                     node.parent_id,
-                    sample.temp_centi_c,
-                    sample.humidity_centi_percent,
+                    sample.temp_centi_c / 100,
+                    sample.temp_centi_c.unsigned_abs() % 100,
+                    sample.humidity_centi_percent / 100,
+                    sample.humidity_centi_percent % 100,
                     frame.gateway_time_ms,
                     bytes
                 );
@@ -354,7 +361,9 @@ fn handle_received_frame(
             );
         }
         (NodeRole::Gateway, FrameType::Hello, _)
-            if frame.node_role == NodeRole::Sensor && frame.hop > 0 =>
+            if frame.node_role == NodeRole::Sensor
+                && frame.hop > 0
+                && frame.dst_id == GATEWAY_ID =>
         {
             println!(
                 "topology: sensor({}) -> relay({}) -> gateway({})  hop={}",
@@ -380,11 +389,13 @@ fn handle_received_frame(
             },
         ) => {
             println!(
-                "rx {} via={} temp={}cC humidity={}c% alarm={} gateway_time={}",
+                "rx {} via={} temp={}.{:02}C humidity={}.{:02}% alarm={} gateway_time={}",
                 frame.frame_type,
                 frame.src_id,
-                temp_centi_c,
-                humidity_centi_percent,
+                temp_centi_c / 100,
+                temp_centi_c.unsigned_abs() % 100,
+                humidity_centi_percent / 100,
+                humidity_centi_percent % 100,
                 alarm,
                 frame.gateway_time_ms
             );
@@ -453,12 +464,9 @@ fn handle_received_frame(
         ) => {
             let ack = node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
             let ack_bytes = lora_transport.send_frame(&ack)?;
-            let forwarded = node.make_forwarded(frame, GATEWAY_ID, local_time_ms)?;
-            let forward_bytes = lora_transport.send_frame(&forwarded)?;
-            pending_ack.remember(&forwarded, local_time_ms);
             println!(
-                "rx HEARTBEAT from={} slot={} hop={} sync_seq={} -> ack_bytes={} forward_bytes={}",
-                frame.src_id, slot_id, hop, sync_seq, ack_bytes, forward_bytes
+                "rx HEARTBEAT from={} slot={} hop={} sync_seq={} -> ack_bytes={}",
+                frame.src_id, slot_id, hop, sync_seq, ack_bytes
             );
         }
         (
@@ -493,19 +501,26 @@ fn handle_received_frame(
                 let forward_bytes = lora_transport.send_frame(&forwarded)?;
                 pending_ack.remember(&forwarded, local_time_ms);
                 println!(
-                    "rx {} from sensor={} temp={}cC humidity={}c% alarm=true -> ack_bytes={} immediate_forward_bytes={}",
+                    "rx {} from sensor={} temp={}.{:02}C humidity={}.{:02}% alarm=true -> ack_bytes={} immediate_forward_bytes={}",
                     frame.frame_type,
                     frame.src_id,
-                    temp_centi_c,
-                    humidity_centi_percent,
+                    temp_centi_c / 100,
+                    temp_centi_c.unsigned_abs() % 100,
+                    humidity_centi_percent / 100,
+                    humidity_centi_percent % 100,
                     ack_bytes,
                     forward_bytes
                 );
             } else {
                 relay_forward.remember(frame);
                 println!(
-                    "rx DATA from sensor={} temp={}cC humidity={}c% -> ack_bytes={} buffered_for_relay_slot=true",
-                    frame.src_id, temp_centi_c, humidity_centi_percent, ack_bytes
+                    "rx DATA from sensor={} temp={}.{:02}C humidity={}.{:02}% -> ack_bytes={} buffered_for_relay_slot=true",
+                    frame.src_id,
+                    temp_centi_c / 100,
+                    temp_centi_c.unsigned_abs() % 100,
+                    humidity_centi_percent / 100,
+                    humidity_centi_percent % 100,
+                    ack_bytes
                 );
             }
         }
