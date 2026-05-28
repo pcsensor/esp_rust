@@ -23,7 +23,7 @@ use esp32c3_rust::sensors::Sht40;
 use esp32c3_rust::{
     AppError, AppResult,
     demo::{DemoNode, EnvironmentSample, FrameAction, NetworkPhase},
-    hardware::{BuzzerConfig, LoraModuleConfigPlan, LoraUartConfig, PinConfig, Sht40Config},
+    hardware::{LoraModuleConfigPlan, LoraUartConfig, PinConfig, Sht40Config},
     protocol::{Frame, FrameType},
     role::{ACTIVE_ROLE, GATEWAY_ID, NodeRole},
     transport::LoraUartTransport,
@@ -275,11 +275,15 @@ async fn run() -> AppResult<()> {
             {
                 if let Some(frame) = relay_forward.take() {
                     let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
+                    // Dual-send for redundancy: send, pause, re-encode, send again.
+                    // Same seq guarantees the receiver can deduplicate.
                     let bytes = lora_transport.send_frame(&forwarded)?;
+                    Timer::after(Duration::from_millis(150)).await;
+                    let bytes2 = lora_transport.send_frame(&forwarded)?;
                     pending_ack.remember(&forwarded, local_time_ms);
                     println!(
-                        "relay slot tx buffered {} sensor_seq={} relay_seq={} bytes={}",
-                        frame.frame_type, frame.seq, forwarded.seq, bytes
+                        "relay slot tx buffered {} sensor_seq={} relay_seq={} bytes={}+{}",
+                        frame.frame_type, frame.seq, forwarded.seq, bytes, bytes2
                     );
                 }
                 println!(
@@ -292,37 +296,10 @@ async fn run() -> AppResult<()> {
                     node.sync.offset_ms
                 );
             }
-            NodeRole::Gateway if slot == node.schedule.alarm_slot => {
-                let uptime_s = elapsed_ms(boot) / 1_000;
-                println!(
-                    "gateway status | uptime={}s sync_seq={} offset_ms={} alarm={} buzzer=GPIO{}",
-                    uptime_s,
-                    node.sync.last_sync_seq,
-                    node.sync.offset_ms,
-                    gateway_alarm_active,
-                    BuzzerConfig::DEFAULT.gpio
-                );
-            }
-            NodeRole::Relay if slot == node.schedule.alarm_slot => {
-                println!(
-                    "relay status | parent={:?} hop={} slot={} sync_seq={} offset_ms={}",
-                    node.parent_id,
-                    node.hop,
-                    node.slot_id,
-                    node.sync.last_sync_seq,
-                    node.sync.offset_ms
-                );
-            }
-            NodeRole::Sensor if slot == node.schedule.alarm_slot => {
-                println!(
-                    "sensor status | parent={:?} hop={} slot={} sync_seq={} offset_ms={}",
-                    node.parent_id,
-                    node.hop,
-                    node.slot_id,
-                    node.sync.last_sync_seq,
-                    node.sync.offset_ms
-                );
-            }
+            // Slot 4 status lines temporarily disabled — uncomment for demo
+            NodeRole::Gateway if slot == node.schedule.alarm_slot => {}
+            NodeRole::Relay if slot == node.schedule.alarm_slot => {}
+            NodeRole::Sensor if slot == node.schedule.alarm_slot => {}
             _ => {}
         }
 

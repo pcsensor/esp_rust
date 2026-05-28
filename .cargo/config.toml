@@ -2,7 +2,7 @@
 target = "riscv32imc-unknown-none-elf"
 
 [target.riscv32imc-unknown-none-elf]
-runner = "probe-rs run --chip esp32c3"
+runner = "probe-rs download --chip esp32c3"
 
 [unstable]
 build-std = ["core"]

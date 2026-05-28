@@ -49,6 +49,7 @@ pub struct DemoNode {
     pub phase: NetworkPhase,
     pub sync: TimeSync,
     pub schedule: TdmaSchedule,
+    last_data_seq: Option<(u8, u16)>,
 }
 
 impl DemoNode {
@@ -62,6 +63,7 @@ impl DemoNode {
             phase: NetworkPhase::Searching,
             sync: TimeSync::new(role.default_hop()),
             schedule: TdmaSchedule::DEMO,
+            last_data_seq: None,
         }
     }
 
@@ -282,6 +284,12 @@ impl DemoNode {
                 }
             }
             FrameType::Data | FrameType::Alarm => {
+                // Skip duplicate DATA/ALARM (dual-send redundancy)
+                let key = (frame.src_id, frame.seq);
+                if self.last_data_seq == Some(key) {
+                    return FrameAction::Ignore;
+                }
+                self.last_data_seq = Some(key);
                 if let Some((temp_centi_c, humidity_centi_percent)) =
                     protocol::decode_data_payload(&frame.payload)
                 {

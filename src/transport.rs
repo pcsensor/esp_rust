@@ -119,37 +119,40 @@ impl LoraTransport for LoraUartTransport<'_> {
 /// **Important**: after this function returns the module reboots; the caller
 /// must wait ~500 ms before sending data frames.
 pub async fn configure_dx_lr32_module(uart: &mut Uart<'_, Blocking>) -> Result<(), LoraUartError> {
-    // Initial guard time — module may still be booting
-    Timer::after(Duration::from_millis(500)).await;
+    // Module needs time after power-up before it can accept AT commands
+    Timer::after(Duration::from_millis(1_500)).await;
 
     for (i, cmd) in DX_LR32_DEMO_AT_SEQUENCE.iter().enumerate() {
         let is_enter = *cmd == "+++" && i == 0;
         let is_exit = *cmd == "+++" && i > 0;
 
-        // Guard time before +++ per DX-LR32 manual §4.1
+        // Guard time before +++: ≥1s silence
         if is_enter || is_exit {
-            Timer::after(Duration::from_millis(500)).await;
+            Timer::after(Duration::from_millis(1_000)).await;
         }
 
         // Each entry in DX_LR32_DEMO_AT_SEQUENCE is sent verbatim
         // (AT commands already include \r\n; +++ is sent bare)
         write_all_raw(uart, cmd.as_bytes())?;
 
+        // Guard time after +++ before reading response: ≥1s silence
+        if is_enter || is_exit {
+            Timer::after(Duration::from_millis(1_000)).await;
+        }
+
         if is_enter {
-            // Wait for "Entry AT" response
             match read_until(uart, b"Entry AT", 3_000).await {
                 Ok(..) => log::info!("DX-LR32: entered AT mode"),
                 Err(LoraUartError::Timeout) => {
-                    log::warn!("DX-LR32: no 'Entry AT' response (already in AT mode?)");
+                    log::warn!("DX-LR32: no 'Entry AT' response");
                 }
                 Err(e) => return Err(e),
             }
         } else if is_exit {
-            // Module auto-resets after exit; give it time
+            // Module auto-resets after exit
             Timer::after(Duration::from_millis(1_500)).await;
             log::info!("DX-LR32: exited AT mode, module rebooting");
         } else {
-            // Read until "OK" or "EEROR"
             match read_until(uart, b"OK", 2_000).await {
                 Ok(..) => log::info!("DX-LR32: {} → OK", cmd),
                 Err(LoraUartError::Timeout) => {

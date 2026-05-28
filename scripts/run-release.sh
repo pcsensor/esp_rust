@@ -21,3 +21,4 @@ case "$role" in
 esac
 
 cargo run --release --no-default-features --features "$feature" "$@"
+probe-rs reset --chip esp32c3
