@@ -72,6 +72,8 @@ async fn main(spawner: Spawner) -> ! {
         panic_on_fatal_error(error);
     }
 
+    // All spawned tasks (core, lora_rx, sensor, buzzer) are now running on the
+    // executor. Yield forever so the executor continues to schedule them.
     loop {
         Timer::after(Duration::from_secs(60)).await;
     }
@@ -140,6 +142,404 @@ async fn lora_rx_task(mut lora_rx: LoraRx<'static>) {
     }
 }
 
+/// Core protocol task: sole owner of the network node state and the UART TX
+/// half. Wakes on incoming frames (from the RX channel) or TDMA slot timers,
+/// handles protocol logic inline, and transmits in its assigned slot window.
+/// All protocol state lives here — no locks needed. Panics on fatal error
+/// (matching the original `run()` behaviour).
+#[embassy_executor::task]
+async fn core_task(
+    mut lora_tx: LoraTx<'static>,
+    mut node: DemoNode,
+    mut gateway_alarm_active: bool,
+    #[cfg(feature = "sensor-node")] mut latest_sensor_sample: EnvironmentSample,
+    #[cfg(feature = "sensor-node")] mut sensor_alarm_active: bool,
+    mut pending_ack: PendingAck,
+    mut relay_forward: RelayForwardBuffer,
+    mut gateway_stats: GatewayStats,
+    boot: Instant,
+) {
+    // Wrap the body in an async block so `?` propagates errors. The loop is
+    // infinite — only an error (via `?`) can exit the block.
+    if let Err(error) = async {
+        let mut pending_sync_forward: Option<Frame> = None;
+        let mut pending_alarm_forward: Option<Frame> = None;
+        let mut last_hello_ms = elapsed_ms(boot);
+
+        match ACTIVE_ROLE {
+            NodeRole::Gateway => {
+                node.mark_joined();
+                println!("gateway online: broadcasting SYNC/SCHEDULE every TDMA superframe");
+            }
+            NodeRole::Relay | NodeRole::Sensor => {
+                let frame = node.make_hello(elapsed_ms(boot))?;
+                let bytes = lora_tx.send_frame(&frame).await?;
+                println!(
+                    "{} searching: send {} seq={} bytes={} parent={:?}",
+                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes, node.parent_id
+                );
+                println!(
+                    "{} searching: preferred_parent={:?} hop={} slot={}",
+                    ACTIVE_ROLE, node.parent_id, node.hop, node.slot_id
+                );
+            }
+        }
+
+        let mut last_tx_slot: Option<u8> = None;
+
+        loop {
+            #[cfg(feature = "sensor-node")]
+            drain_sensor_alarm_events(
+                &mut latest_sensor_sample,
+                &mut sensor_alarm_active,
+                &mut pending_ack,
+            );
+
+            let local_time_ms = elapsed_ms(boot);
+            let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
+            let slot = node.schedule.slot_at(gateway_time_ms);
+
+            #[cfg(feature = "gateway-node")]
+            {
+                gateway_stats.update_sync(
+                    node.sync.last_sync_seq,
+                    node.sync.offset_ms,
+                    node.sync.offset_delta_ms,
+                );
+                if gateway_stats.should_report(gateway_time_ms) {
+                    demo_log::print_gateway_stats(&gateway_stats, gateway_time_ms);
+                    gateway_stats.mark_reported(gateway_time_ms);
+                }
+            }
+
+            let follow_schedule = node.is_synced()
+                && (node.role == NodeRole::Gateway || node.phase == NetworkPhase::Joined);
+
+            enum CoreWake {
+                Frame(Frame),
+                #[cfg(feature = "sensor-node")]
+                SensorAlarm(AlarmTransition),
+                Timer,
+            }
+
+            let wait_ms = if follow_schedule {
+                tx_window_delay_ms(&node, gateway_time_ms, slot, last_tx_slot)
+            } else if node.phase == NetworkPhase::Searching
+                && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
+            {
+                (last_hello_ms + HELLO_RETRY_INTERVAL_MS).saturating_sub(local_time_ms)
+            } else {
+                HELLO_RETRY_INTERVAL_MS
+            };
+
+            #[cfg(feature = "sensor-node")]
+            let wake = if wait_ms == 0 {
+                drain_sensor_alarm_events(
+                    &mut latest_sensor_sample,
+                    &mut sensor_alarm_active,
+                    &mut pending_ack,
+                );
+                CoreWake::Timer
+            } else {
+                match select3(
+                    RX_FRAMES.receive(),
+                    ALARM_EVENTS.receive(),
+                    Timer::after(Duration::from_millis(wait_ms)),
+                )
+                .await
+                {
+                    Either3::First(frame) => CoreWake::Frame(frame),
+                    Either3::Second(transition) => CoreWake::SensorAlarm(transition),
+                    Either3::Third(()) => CoreWake::Timer,
+                }
+            };
+
+            #[cfg(not(feature = "sensor-node"))]
+            let wake = if wait_ms == 0 {
+                CoreWake::Timer
+            } else {
+                match select(
+                    RX_FRAMES.receive(),
+                    Timer::after(Duration::from_millis(wait_ms)),
+                )
+                .await
+                {
+                    Either::First(frame) => CoreWake::Frame(frame),
+                    Either::Second(()) => CoreWake::Timer,
+                }
+            };
+
+            match wake {
+                CoreWake::Frame(frame) => {
+                    handle_received_frame(
+                        &mut node,
+                        &mut lora_tx,
+                        &frame,
+                        elapsed_ms(boot),
+                        &mut gateway_alarm_active,
+                        &mut pending_ack,
+                        &mut relay_forward,
+                        &mut pending_sync_forward,
+                        &mut pending_alarm_forward,
+                        &mut gateway_stats,
+                    )
+                    .await?;
+                    continue;
+                }
+                #[cfg(feature = "sensor-node")]
+                CoreWake::SensorAlarm(transition) => {
+                    handle_sensor_alarm_transition(
+                        transition,
+                        &mut latest_sensor_sample,
+                        &mut sensor_alarm_active,
+                        &mut pending_ack,
+                    );
+                    continue;
+                }
+                CoreWake::Timer => {}
+            }
+
+            if !follow_schedule {
+                let local_time_ms = elapsed_ms(boot);
+                if node.phase == NetworkPhase::Searching
+                    && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
+                    && local_time_ms.saturating_sub(last_hello_ms) >= HELLO_RETRY_INTERVAL_MS
+                {
+                    let frame = node.make_hello(local_time_ms)?;
+                    let bytes = lora_tx.send_frame(&frame).await?;
+                    last_hello_ms = local_time_ms;
+                    println!(
+                        "{} searching: retry {} seq={} bytes={}",
+                        ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
+                    );
+                }
+                continue;
+            }
+
+            let local_time_ms = elapsed_ms(boot);
+            let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
+            if !node.schedule.is_active_window(gateway_time_ms) {
+                continue;
+            }
+            let slot = node.schedule.slot_at(gateway_time_ms);
+            if last_tx_slot == Some(slot) {
+                continue;
+            }
+            last_tx_slot = Some(slot);
+
+            {
+                match ACTIVE_ROLE {
+                    NodeRole::Gateway if slot == node.schedule.sync_slot => {
+                        let frame = node.make_sync(local_time_ms)?;
+                        let bytes = lora_tx.send_frame(&frame).await?;
+                        println!(
+                            "tx {} frame_seq={} sync_seq={} schedule_v={} active={}ms guard_before={}ms gateway_time={} slot={} bytes={}",
+                            frame.frame_type,
+                            frame.seq,
+                            node.sync_seq,
+                            node.schedule.schedule_version,
+                            node.schedule.active_ms,
+                            node.schedule.guard_before_ms,
+                            frame.gateway_time_ms,
+                            slot,
+                            bytes
+                        );
+
+                        #[cfg(feature = "gateway-node")]
+                        {
+                            if !gateway_alarm_active {
+                                BUZZER_SIG.signal(BuzzerAction::Off);
+                            }
+                        }
+                    }
+                    NodeRole::Relay | NodeRole::Sensor
+                        if node.phase == NetworkPhase::Joined
+                            && slot == node.schedule.alarm_retry_slot =>
+                    {
+                        if let Some((frame, attempt)) = pending_ack.next_retry(local_time_ms) {
+                            let bytes = lora_tx.send_frame(&frame).await?;
+                            println!(
+                                "{} retry {} seq={} attempt={} bytes={}",
+                                ACTIVE_ROLE, frame.frame_type, frame.seq, attempt, bytes
+                            );
+                        } else if pending_ack.is_exhausted(local_time_ms) {
+                            if let Some((seq, frame_type)) = pending_ack.drop_exhausted() {
+                                println!(
+                                    "{} drop {} seq={} after {} attempts",
+                                    ACTIVE_ROLE,
+                                    frame_type,
+                                    seq,
+                                    PendingAck::MAX_ATTEMPTS
+                                );
+                            }
+                        }
+                    }
+                    NodeRole::Relay
+                        if node.phase == NetworkPhase::Joined
+                            && slot == node.schedule.relay_control_slot =>
+                    {
+                        if let Some(sync_frame) = pending_sync_forward.take() {
+                            let forwarded = node.make_forwarded(
+                                &sync_frame,
+                                esp32c3_rust::role::BROADCAST_ID,
+                                local_time_ms,
+                            )?;
+                            let bytes = lora_tx.send_frame(&forwarded).await?;
+                            println!(
+                                "relay control slot: forward SYNC sync_seq={} offset_ms={} drift={}ms bytes={}",
+                                node.sync.last_sync_seq,
+                                node.sync.offset_ms,
+                                node.sync.offset_delta_ms,
+                                bytes
+                            );
+                        }
+                    }
+                    NodeRole::Relay
+                        if node.phase == NetworkPhase::Joined
+                            && slot == node.schedule.relay_heartbeat_slot =>
+                    {
+                        let frame = node.make_heartbeat(local_time_ms)?;
+                        let bytes = lora_tx.send_frame(&frame).await?;
+                        println!(
+                            "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
+                            ACTIVE_ROLE,
+                            frame.seq,
+                            node.parent_id,
+                            node.slot_id,
+                            node.schedule.relay_heartbeat_slot,
+                            node.sync.last_sync_seq,
+                            node.sync.offset_ms,
+                            node.sync.offset_delta_ms,
+                            bytes
+                        );
+                    }
+                    NodeRole::Sensor
+                        if node.phase == NetworkPhase::Joined
+                            && slot == node.schedule.sensor_heartbeat_slot =>
+                    {
+                        let frame = node.make_heartbeat(local_time_ms)?;
+                        let bytes = lora_tx.send_frame(&frame).await?;
+                        println!(
+                            "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
+                            ACTIVE_ROLE,
+                            frame.seq,
+                            node.parent_id,
+                            node.slot_id,
+                            node.schedule.sensor_heartbeat_slot,
+                            node.sync.last_sync_seq,
+                            node.sync.offset_ms,
+                            node.sync.offset_delta_ms,
+                            bytes
+                        );
+                    }
+                    #[cfg(feature = "sensor-node")]
+                    NodeRole::Sensor
+                        if node.phase == NetworkPhase::Joined && slot == node.schedule.sensor_slot =>
+                    {
+                        take_latest_sensor_sample(&mut latest_sensor_sample);
+
+                        let sample = latest_sensor_sample;
+                        let alarm = sensor_alarm_active;
+                        let frame = if alarm {
+                            node.make_alarm(
+                                local_time_ms,
+                                sample.temp_centi_c,
+                                sample.humidity_centi_percent,
+                            )?
+                        } else {
+                            node.make_data(
+                                local_time_ms,
+                                sample.temp_centi_c,
+                                sample.humidity_centi_percent,
+                            )?
+                        };
+                        let bytes = if alarm {
+                            lora_tx.send_frame(&frame).await?
+                        } else {
+                            send_best_effort(&mut lora_tx, &frame, BEST_EFFORT_TX_REPEATS).await?
+                        };
+                        pending_ack.remember(&frame, local_time_ms);
+                        println!(
+                            "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
+                            frame.frame_type,
+                            frame.seq,
+                            node.parent_id,
+                            sample.temp_centi_c / 100,
+                            sample.temp_centi_c.unsigned_abs() % 100,
+                            sample.humidity_centi_percent / 100,
+                            sample.humidity_centi_percent % 100,
+                            frame.gateway_time_ms,
+                            bytes
+                        );
+                    }
+                    NodeRole::Relay
+                        if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
+                    {
+                        if let Some(alarm_frame) = pending_alarm_forward.take() {
+                            let forwarded =
+                                node.make_forwarded(&alarm_frame, GATEWAY_ID, local_time_ms)?;
+                            let origin_seq = origin_seq(&alarm_frame);
+                            let bytes = lora_tx.send_frame(&forwarded).await?;
+                            pending_ack.remember(&forwarded, local_time_ms);
+                            println!(
+                                "relay slot tx ALARM origin_seq={} relay_seq={} ack_required=true bytes={}",
+                                origin_seq, forwarded.seq, bytes
+                            );
+                        }
+                        let mut forwarded_count = 0;
+                        while forwarded_count < MAX_FORWARD_PER_SLOT {
+                            let Some(frame) = relay_forward.take() else {
+                                break;
+                            };
+                            let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
+                            let bytes =
+                                send_best_effort(&mut lora_tx, &forwarded, BEST_EFFORT_TX_REPEATS)
+                                    .await?;
+                            let origin_seq = origin_seq(&frame);
+                            pending_ack.remember(&forwarded, local_time_ms);
+                            forwarded_count += 1;
+                            println!(
+                                "relay slot tx buffered {} origin_seq={} relay_seq={} ack_required={} bytes={}",
+                                frame.frame_type,
+                                origin_seq,
+                                forwarded.seq,
+                                is_ack_required(forwarded.frame_type),
+                                bytes
+                            );
+                        }
+                        println!(
+                            "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={} offset_delta={}ms",
+                            relay_forward.has_pending(),
+                            pending_ack.has_pending(),
+                            node.parent_id,
+                            node.hop,
+                            node.sync.last_sync_seq,
+                            node.sync.offset_ms,
+                            node.sync.offset_delta_ms
+                        );
+                    }
+                    NodeRole::Gateway if slot == node.schedule.alarm_retry_slot => {}
+                    NodeRole::Relay if slot == node.schedule.alarm_retry_slot => {}
+                    NodeRole::Sensor if slot == node.schedule.alarm_retry_slot => {}
+                    NodeRole::Gateway if slot == node.schedule.quiet_slot => {}
+                    NodeRole::Relay if slot == node.schedule.quiet_slot => {}
+                    NodeRole::Sensor if slot == node.schedule.quiet_slot => {}
+                    _ => {}
+                }
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Ok::<(), AppError>(())
+    }
+    .await
+    {
+        panic_on_fatal_error(error);
+    }
+}
+
+/// Initialise hardware, spawn every task, then return so the executor can
+/// schedule them. After this function returns, `main()` enters its idle loop.
 async fn run(spawner: Spawner) -> AppResult<()> {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -194,11 +594,9 @@ async fn run(spawner: Spawner) -> AppResult<()> {
     // interrupt-driven async and split it into independently owned halves.
     let (uart_rx, uart_tx) = uart.into_async().split();
     let lora_rx = LoraRx::new(uart_rx);
-    let mut lora_tx = LoraTx::new(uart_tx);
+    let lora_tx = LoraTx::new(uart_tx);
 
-    // The RX half lives entirely inside its own task from here on. The task
-    // function reserves a slot from its (size-1) pool; spawning it here at boot
-    // always succeeds, so a failure is an unrecoverable wiring bug.
+    // The RX half lives entirely inside its own task from here on.
     let rx_token = lora_rx_task(lora_rx).expect("lora_rx_task pool exhausted");
     spawner.spawn(rx_token);
 
@@ -225,409 +623,24 @@ async fn run(spawner: Spawner) -> AppResult<()> {
         spawner.spawn(sensor_token);
     }
 
-    let mut node = DemoNode::new(ACTIVE_ROLE);
-    let mut gateway_alarm_active = false;
-    #[cfg(feature = "sensor-node")]
-    let mut latest_sensor_sample = EnvironmentSample::normal();
-    #[cfg(feature = "sensor-node")]
-    let mut sensor_alarm_active = false;
-    let mut pending_ack = PendingAck::new();
-    let mut relay_forward = RelayForwardBuffer::new();
-    // SYNC re-broadcast is deferred to the relay control slot instead of being
-    // sent inline, so it stays inside the TDMA schedule.
-    let mut pending_sync_forward: Option<Frame> = None;
-    // A received ALARM is forwarded by the relay in its own slot (slot 3) rather
-    // than inline on receipt, so the second hop stays inside the TDMA schedule.
-    let mut pending_alarm_forward: Option<Frame> = None;
-    let mut gateway_stats = GatewayStats::new();
-    let boot = Instant::now();
-    // Tracks the last HELLO send while searching so retries run on a local timer
-    // (decoupled from the unsynchronized clock's arbitrary slot boundaries).
-    let mut last_hello_ms = elapsed_ms(boot);
-
-    match ACTIVE_ROLE {
-        NodeRole::Gateway => {
-            node.mark_joined();
-            println!("gateway online: broadcasting SYNC/SCHEDULE every TDMA superframe");
-        }
-        NodeRole::Relay | NodeRole::Sensor => {
-            let frame = node.make_hello(elapsed_ms(boot))?;
-            let bytes = lora_tx.send_frame(&frame).await?;
-            println!(
-                "{} searching: send {} seq={} bytes={} parent={:?}",
-                ACTIVE_ROLE, frame.frame_type, frame.seq, bytes, node.parent_id
-            );
-            println!(
-                "{} searching: preferred_parent={:?} hop={} slot={}",
-                ACTIVE_ROLE, node.parent_id, node.hop, node.slot_id
-            );
-        }
-    }
-
-    // Tracks the last slot whose TX action ran, so each slot transmits exactly
-    // once even though the select loop may wake several times per slot on RX.
-    let mut last_tx_slot: Option<u8> = None;
-
-    loop {
+    // Spawn the core protocol task — it owns all node state and runs forever.
+    let core_token = core_task(
+        lora_tx,
+        DemoNode::new(ACTIVE_ROLE),
+        false,
         #[cfg(feature = "sensor-node")]
-        drain_sensor_alarm_events(
-            &mut latest_sensor_sample,
-            &mut sensor_alarm_active,
-            &mut pending_ack,
-        );
-
-        let local_time_ms = elapsed_ms(boot);
-        let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
-        let slot = node.schedule.slot_at(gateway_time_ms);
-
-        #[cfg(feature = "gateway-node")]
-        {
-            gateway_stats.update_sync(
-                node.sync.last_sync_seq,
-                node.sync.offset_ms,
-                node.sync.offset_delta_ms,
-            );
-            if gateway_stats.should_report(gateway_time_ms) {
-                demo_log::print_gateway_stats(&gateway_stats, gateway_time_ms);
-                gateway_stats.mark_reported(gateway_time_ms);
-            }
-        }
-
-        // Only follow the TDMA schedule once the clock is trustworthy (synced)
-        // and, for relay/sensor, the node has joined. Until then stay RX-heavy and
-        // retry HELLO on a local timer so an unsynchronized clock never drives
-        // slot-based transmission.
-        let follow_schedule = node.is_synced()
-            && (node.role == NodeRole::Gateway || node.phase == NetworkPhase::Joined);
-
-        enum CoreWake {
-            Frame(Frame),
-            #[cfg(feature = "sensor-node")]
-            SensorAlarm(AlarmTransition),
-            Timer,
-        }
-
-        // Wake on whichever comes first: a decoded frame (handled immediately,
-        // decoupled from TX timing) or this iteration's timer — the slot TX
-        // window when following the schedule, otherwise the HELLO retry tick.
-        let wait_ms = if follow_schedule {
-            tx_window_delay_ms(&node, gateway_time_ms, slot, last_tx_slot)
-        } else if node.phase == NetworkPhase::Searching
-            && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
-        {
-            (last_hello_ms + HELLO_RETRY_INTERVAL_MS).saturating_sub(local_time_ms)
-        } else {
-            HELLO_RETRY_INTERVAL_MS
-        };
-
+        EnvironmentSample::normal(),
         #[cfg(feature = "sensor-node")]
-        let wake = if wait_ms == 0 {
-            CoreWake::Timer
-        } else {
-            match select3(
-                RX_FRAMES.receive(),
-                ALARM_EVENTS.receive(),
-                Timer::after(Duration::from_millis(wait_ms)),
-            )
-            .await
-            {
-                Either3::First(frame) => CoreWake::Frame(frame),
-                Either3::Second(transition) => CoreWake::SensorAlarm(transition),
-                Either3::Third(()) => CoreWake::Timer,
-            }
-        };
+        false,
+        PendingAck::new(),
+        RelayForwardBuffer::new(),
+        GatewayStats::new(),
+        Instant::now(),
+    )
+    .expect("core_task pool exhausted");
+    spawner.spawn(core_token);
 
-        #[cfg(not(feature = "sensor-node"))]
-        let wake = if wait_ms == 0 {
-            CoreWake::Timer
-        } else {
-            match select(
-                RX_FRAMES.receive(),
-                Timer::after(Duration::from_millis(wait_ms)),
-            )
-            .await
-            {
-                Either::First(frame) => CoreWake::Frame(frame),
-                Either::Second(()) => CoreWake::Timer,
-            }
-        };
-
-        match wake {
-            CoreWake::Frame(frame) => {
-                // Handle the frame immediately (including any ACK / JOIN_ACK
-                // reply). The RX task keeps draining the FIFO while we work.
-                handle_received_frame(
-                    &mut node,
-                    &mut lora_tx,
-                    &frame,
-                    elapsed_ms(boot),
-                    &mut gateway_alarm_active,
-                    &mut pending_ack,
-                    &mut relay_forward,
-                    &mut pending_sync_forward,
-                    &mut pending_alarm_forward,
-                    &mut gateway_stats,
-                )
-                .await?;
-                continue;
-            }
-            #[cfg(feature = "sensor-node")]
-            CoreWake::SensorAlarm(transition) => {
-                handle_sensor_alarm_transition(
-                    transition,
-                    &mut latest_sensor_sample,
-                    &mut sensor_alarm_active,
-                    &mut pending_ack,
-                );
-                continue;
-            }
-            CoreWake::Timer => {}
-        }
-
-        if !follow_schedule {
-            // Searching (unsynced): retry HELLO on the local-time cadence rather
-            // than on TDMA slot boundaries, which are meaningless before sync.
-            let local_time_ms = elapsed_ms(boot);
-            if node.phase == NetworkPhase::Searching
-                && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
-                && local_time_ms.saturating_sub(last_hello_ms) >= HELLO_RETRY_INTERVAL_MS
-            {
-                let frame = node.make_hello(local_time_ms)?;
-                let bytes = lora_tx.send_frame(&frame).await?;
-                last_hello_ms = local_time_ms;
-                println!(
-                    "{} searching: retry {} seq={} bytes={}",
-                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
-                );
-            }
-            continue;
-        }
-
-        // The TX window timer fired. Recompute at fire time and perform the
-        // role-specific TX exactly once per slot (deduplicated via last_tx_slot).
-        let local_time_ms = elapsed_ms(boot);
-        let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
-        if !node.schedule.is_active_window(gateway_time_ms) {
-            continue;
-        }
-        let slot = node.schedule.slot_at(gateway_time_ms);
-        if last_tx_slot == Some(slot) {
-            continue;
-        }
-        last_tx_slot = Some(slot);
-
-        {
-            match ACTIVE_ROLE {
-                NodeRole::Gateway if slot == node.schedule.sync_slot => {
-                    let frame = node.make_sync(local_time_ms)?;
-                    let bytes = lora_tx.send_frame(&frame).await?;
-                    println!(
-                        "tx {} frame_seq={} sync_seq={} schedule_v={} active={}ms guard_before={}ms gateway_time={} slot={} bytes={}",
-                        frame.frame_type,
-                        frame.seq,
-                        node.sync_seq,
-                        node.schedule.schedule_version,
-                        node.schedule.active_ms,
-                        node.schedule.guard_before_ms,
-                        frame.gateway_time_ms,
-                        slot,
-                        bytes
-                    );
-
-                    #[cfg(feature = "gateway-node")]
-                    {
-                        if !gateway_alarm_active {
-                            BUZZER_SIG.signal(BuzzerAction::Off);
-                        }
-                    }
-                }
-                NodeRole::Relay | NodeRole::Sensor
-                    if node.phase == NetworkPhase::Joined
-                        && slot == node.schedule.alarm_retry_slot =>
-                {
-                    if let Some((frame, attempt)) = pending_ack.next_retry(local_time_ms) {
-                        let bytes = lora_tx.send_frame(&frame).await?;
-                        println!(
-                            "{} retry {} seq={} attempt={} bytes={}",
-                            ACTIVE_ROLE, frame.frame_type, frame.seq, attempt, bytes
-                        );
-                    } else if pending_ack.is_exhausted(local_time_ms) {
-                        if let Some((seq, frame_type)) = pending_ack.drop_exhausted() {
-                            println!(
-                                "{} drop {} seq={} after {} attempts",
-                                ACTIVE_ROLE,
-                                frame_type,
-                                seq,
-                                PendingAck::MAX_ATTEMPTS
-                            );
-                        }
-                    }
-                }
-                NodeRole::Relay
-                    if node.phase == NetworkPhase::Joined
-                        && slot == node.schedule.relay_control_slot =>
-                {
-                    // Re-broadcast the latest SYNC inside the reserved control
-                    // slot instead of inline on receipt, keeping it in-schedule.
-                    if let Some(sync_frame) = pending_sync_forward.take() {
-                        let forwarded = node.make_forwarded(
-                            &sync_frame,
-                            esp32c3_rust::role::BROADCAST_ID,
-                            local_time_ms,
-                        )?;
-                        let bytes = lora_tx.send_frame(&forwarded).await?;
-                        println!(
-                            "relay control slot: forward SYNC sync_seq={} offset_ms={} drift={}ms bytes={}",
-                            node.sync.last_sync_seq,
-                            node.sync.offset_ms,
-                            node.sync.offset_delta_ms,
-                            bytes
-                        );
-                    }
-                }
-                NodeRole::Relay
-                    if node.phase == NetworkPhase::Joined
-                        && slot == node.schedule.relay_heartbeat_slot =>
-                {
-                    let frame = node.make_heartbeat(local_time_ms)?;
-                    let bytes = lora_tx.send_frame(&frame).await?;
-                    println!(
-                        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
-                        ACTIVE_ROLE,
-                        frame.seq,
-                        node.parent_id,
-                        node.slot_id,
-                        node.schedule.relay_heartbeat_slot,
-                        node.sync.last_sync_seq,
-                        node.sync.offset_ms,
-                        node.sync.offset_delta_ms,
-                        bytes
-                    );
-                }
-                NodeRole::Sensor
-                    if node.phase == NetworkPhase::Joined
-                        && slot == node.schedule.sensor_heartbeat_slot =>
-                {
-                    let frame = node.make_heartbeat(local_time_ms)?;
-                    let bytes = lora_tx.send_frame(&frame).await?;
-                    println!(
-                        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
-                        ACTIVE_ROLE,
-                        frame.seq,
-                        node.parent_id,
-                        node.slot_id,
-                        node.schedule.sensor_heartbeat_slot,
-                        node.sync.last_sync_seq,
-                        node.sync.offset_ms,
-                        node.sync.offset_delta_ms,
-                        bytes
-                    );
-                }
-                #[cfg(feature = "sensor-node")]
-                NodeRole::Sensor
-                    if node.phase == NetworkPhase::Joined && slot == node.schedule.sensor_slot =>
-                {
-                    take_latest_sensor_sample(&mut latest_sensor_sample);
-
-                    let sample = latest_sensor_sample;
-                    let alarm = sensor_alarm_active;
-                    let frame = if alarm {
-                        node.make_alarm(
-                            local_time_ms,
-                            sample.temp_centi_c,
-                            sample.humidity_centi_percent,
-                        )?
-                    } else {
-                        node.make_data(
-                            local_time_ms,
-                            sample.temp_centi_c,
-                            sample.humidity_centi_percent,
-                        )?
-                    };
-                    // ALARM is covered by hop-by-hop ACK/retry, so send it once;
-                    // best-effort DATA is repeated for redundancy (receivers
-                    // de-duplicate on (src_id, seq)).
-                    let bytes = if alarm {
-                        lora_tx.send_frame(&frame).await?
-                    } else {
-                        send_best_effort(&mut lora_tx, &frame, BEST_EFFORT_TX_REPEATS).await?
-                    };
-                    pending_ack.remember(&frame, local_time_ms);
-                    println!(
-                        "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
-                        frame.frame_type,
-                        frame.seq,
-                        node.parent_id,
-                        sample.temp_centi_c / 100,
-                        sample.temp_centi_c.unsigned_abs() % 100,
-                        sample.humidity_centi_percent / 100,
-                        sample.humidity_centi_percent % 100,
-                        frame.gateway_time_ms,
-                        bytes
-                    );
-                }
-                NodeRole::Relay
-                    if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
-                {
-                    // Second ALARM hop (relay -> gateway) runs here, inside the
-                    // relay slot, instead of inline on receipt — keeping it in the
-                    // TDMA schedule. It carries an ACK and is retried in slot 4.
-                    if let Some(alarm_frame) = pending_alarm_forward.take() {
-                        let forwarded =
-                            node.make_forwarded(&alarm_frame, GATEWAY_ID, local_time_ms)?;
-                        let origin_seq = origin_seq(&alarm_frame);
-                        let bytes = lora_tx.send_frame(&forwarded).await?;
-                        pending_ack.remember(&forwarded, local_time_ms);
-                        println!(
-                            "relay slot tx ALARM origin_seq={} relay_seq={} ack_required=true bytes={}",
-                            origin_seq, forwarded.seq, bytes
-                        );
-                    }
-                    // Forward up to MAX_FORWARD_PER_SLOT buffered DATA frames so a
-                    // backlog drains instead of being overwritten; each is sent
-                    // best-effort (repeated) since only ALARM carries an ACK.
-                    let mut forwarded_count = 0;
-                    while forwarded_count < MAX_FORWARD_PER_SLOT {
-                        let Some(frame) = relay_forward.take() else {
-                            break;
-                        };
-                        let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
-                        let bytes =
-                            send_best_effort(&mut lora_tx, &forwarded, BEST_EFFORT_TX_REPEATS)
-                                .await?;
-                        let origin_seq = origin_seq(&frame);
-                        pending_ack.remember(&forwarded, local_time_ms);
-                        forwarded_count += 1;
-                        println!(
-                            "relay slot tx buffered {} origin_seq={} relay_seq={} ack_required={} bytes={}",
-                            frame.frame_type,
-                            origin_seq,
-                            forwarded.seq,
-                            is_ack_required(forwarded.frame_type),
-                            bytes
-                        );
-                    }
-                    println!(
-                        "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={} offset_delta={}ms",
-                        relay_forward.has_pending(),
-                        pending_ack.has_pending(),
-                        node.parent_id,
-                        node.hop,
-                        node.sync.last_sync_seq,
-                        node.sync.offset_ms,
-                        node.sync.offset_delta_ms
-                    );
-                }
-                NodeRole::Gateway if slot == node.schedule.alarm_retry_slot => {}
-                NodeRole::Relay if slot == node.schedule.alarm_retry_slot => {}
-                NodeRole::Sensor if slot == node.schedule.alarm_retry_slot => {}
-                NodeRole::Gateway if slot == node.schedule.quiet_slot => {}
-                NodeRole::Relay if slot == node.schedule.quiet_slot => {}
-                NodeRole::Sensor if slot == node.schedule.quiet_slot => {}
-                _ => {}
-            }
-        }
-    }
+    Ok(())
 }
 
 /// Maximum buffered DATA frames the relay forwards within one relay slot,
@@ -1047,37 +1060,8 @@ impl PendingAck {
         }
     }
 
-    fn clear_if_matches(&mut self, acked_seq: u16, acked_type: FrameType) -> bool {
-        let Some(frame) = &self.frame else {
-            return false;
-        };
-
-        if frame.seq == acked_seq && frame.frame_type == acked_type {
-            self.frame = None;
-            self.attempts = 0;
-            self.last_sent_ms = 0;
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(feature = "sensor-node")]
-    fn cancel_if_matches(&mut self, frame_type: FrameType) -> bool {
-        let Some(frame) = &self.frame else {
-            return false;
-        };
-
-        if frame.frame_type == frame_type {
-            self.frame = None;
-            self.attempts = 0;
-            self.last_sent_ms = 0;
-            true
-        } else {
-            false
-        }
-    }
-
+    /// Next retry frame and attempt number, if we've waited long enough
+    /// and haven't exceeded the maximum attempts.
     fn next_retry(&mut self, now_ms: u64) -> Option<(Frame, u8)> {
         let frame = self.frame.as_ref()?;
         if self.attempts >= Self::MAX_ATTEMPTS {
@@ -1086,8 +1070,7 @@ impl PendingAck {
         if now_ms.saturating_sub(self.last_sent_ms) < Self::RETRY_DELAY_MS {
             return None;
         }
-
-        self.attempts = self.attempts.saturating_add(1);
+        self.attempts += 1;
         self.last_sent_ms = now_ms;
         Some((frame.clone(), self.attempts))
     }
@@ -1100,14 +1083,39 @@ impl PendingAck {
 
     fn drop_exhausted(&mut self) -> Option<(u16, FrameType)> {
         let frame = self.frame.take()?;
-        self.attempts = 0;
-        self.last_sent_ms = 0;
         Some((frame.seq, frame.frame_type))
+    }
+
+    fn clear_if_matches(&mut self, seq: u16, frame_type: FrameType) -> bool {
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|f| f.seq == seq && f.frame_type == frame_type)
+        {
+            self.frame = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "sensor-node")]
+    fn cancel_if_matches(&mut self, frame_type: FrameType) -> bool {
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|f| f.frame_type == frame_type)
+        {
+            self.frame = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
 fn is_ack_required(frame_type: FrameType) -> bool {
-    // Only ALARM needs guaranteed delivery with ACK/retry.
+    // Only ALARM uses hop-by-hop ACK with bounded (up to MAX_ATTEMPTS) retry.
     // DATA and HEARTBEAT are periodic best-effort — one lost is acceptable.
     matches!(frame_type, FrameType::Alarm)
 }
