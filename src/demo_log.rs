@@ -1,4 +1,7 @@
 use crate::protocol::{Frame, FrameType};
+// On the embedded target `println!` comes from esp-println; on the host it comes
+// from the std prelude, so the logging helpers compile in both environments.
+#[cfg(target_os = "none")]
 use esp_println::println;
 
 const LINE_BOLD: &str = "==============================================================";
@@ -91,9 +94,10 @@ impl GatewayStats {
 
         let origin_seq_gap = self.last_origin_seq.and_then(|last_seq| {
             let delta = origin_seq.wrapping_sub(last_seq);
-            // Sensor emits HEARTBEAT frames between periodic DATA frames, so a
-            // delta of 2 is normal in this demo. Larger gaps are worth showing.
-            (delta > 2).then_some(delta - 2)
+            // HEARTBEAT now uses an independent sequence space, so consecutive
+            // DATA/ALARM origin sequences differ by exactly 1. Any larger delta
+            // means that many periodic frames were lost in between.
+            (delta > 1).then_some(delta - 1)
         });
         if let Some(gap) = origin_seq_gap {
             self.origin_seq_gap_total = self.origin_seq_gap_total.saturating_add(gap as u32);

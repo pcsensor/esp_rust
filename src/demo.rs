@@ -48,6 +48,7 @@ pub struct DemoNode {
     pub hop: u8,
     pub slot_id: u8,
     pub seq: u16,
+    pub heartbeat_seq: u16,
     pub sync_seq: u16,
     pub phase: NetworkPhase,
     pub sync: TimeSync,
@@ -64,6 +65,7 @@ impl DemoNode {
             hop: role.default_hop(),
             slot_id: role.default_slot(),
             seq: 0,
+            heartbeat_seq: 0,
             sync_seq: 0,
             phase: NetworkPhase::Searching,
             sync: TimeSync::new(role.default_hop()),
@@ -80,6 +82,13 @@ impl DemoNode {
     pub fn next_seq(&mut self) -> u16 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
+    }
+
+    /// HEARTBEAT uses its own sequence space so periodic DATA/ALARM origin
+    /// sequence numbers stay strictly consecutive, keeping gap accounting exact.
+    pub fn next_heartbeat_seq(&mut self) -> u16 {
+        self.heartbeat_seq = self.heartbeat_seq.wrapping_add(1);
+        self.heartbeat_seq
     }
 
     pub fn make_hello(&mut self, local_time_ms: u64) -> AppResult<Frame> {
@@ -220,7 +229,7 @@ impl DemoNode {
     }
 
     pub fn make_heartbeat(&mut self, local_time_ms: u64) -> AppResult<Frame> {
-        let seq = self.next_seq();
+        let seq = self.next_heartbeat_seq();
         Ok(Frame {
             net_id: NET_ID,
             src_id: self.role.node_id(),

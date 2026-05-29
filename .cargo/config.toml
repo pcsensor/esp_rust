@@ -7,5 +7,19 @@ runner = "probe-rs download --chip esp32c3"
 [unstable]
 build-std = ["core"]
 
+# Run the hardware-independent unit tests on the host. Overrides the bare-metal
+# `[build] target` with the host triple and rebuilds the full sysroot from
+# source (the global `build-std = ["core"]` is not enough for the std test
+# harness). Usage: `cargo test-host`.
+[alias]
+test-host = [
+    "test",
+    "--lib",
+    "--target",
+    "aarch64-apple-darwin",
+    "--config",
+    "unstable.build-std=[\"std\",\"core\",\"alloc\",\"panic_unwind\",\"proc_macro\",\"test\"]",
+]
+
 [env]
 ESP_LOG = "info"

@@ -100,3 +100,88 @@ impl TimeSync {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: TdmaSchedule = TdmaSchedule::DEMO;
+
+    #[test]
+    fn slot_at_maps_and_wraps_across_superframe() {
+        assert_eq!(S.slot_at(0), 0);
+        assert_eq!(S.slot_at(999), 0);
+        assert_eq!(S.slot_at(1_000), 1);
+        assert_eq!(S.slot_at(2_500), 2);
+        assert_eq!(S.slot_at(7_999), 7);
+        // Wraps at the 8 s superframe boundary.
+        assert_eq!(S.slot_at(8_000), 0);
+        assert_eq!(S.slot_at(8_000 + 3_400), 3);
+    }
+
+    #[test]
+    fn slot_elapsed_is_offset_within_slot() {
+        assert_eq!(S.slot_elapsed_ms(0), 0);
+        assert_eq!(S.slot_elapsed_ms(1_500), 500);
+        assert_eq!(S.slot_elapsed_ms(8_000 + 250), 250);
+    }
+
+    #[test]
+    fn active_window_excludes_guard_bands() {
+        // active_end = guard_before(100) + active(700) = 800.
+        assert_eq!(S.active_end_ms(), 800);
+        // Pre-guard: not active.
+        assert!(!S.is_active_window(0));
+        assert!(!S.is_active_window(99));
+        // Active window [100, 800).
+        assert!(S.is_active_window(100));
+        assert!(S.is_active_window(799));
+        // Post-guard: not active.
+        assert!(!S.is_active_window(800));
+        assert!(!S.is_active_window(999));
+        // Boundaries repeat every slot.
+        assert!(!S.is_active_window(1_099));
+        assert!(S.is_active_window(1_100));
+    }
+
+    #[test]
+    fn next_slot_delay_counts_down_to_boundary() {
+        assert_eq!(S.next_slot_delay_ms(0), 1_000);
+        assert_eq!(S.next_slot_delay_ms(1_500), 500);
+        assert_eq!(S.next_slot_delay_ms(7_999), 1);
+    }
+
+    #[test]
+    fn time_sync_first_sample_sets_offset_without_drift() {
+        let mut sync = TimeSync::new(0);
+        sync.apply_sync(1, 1_000, 900);
+        assert_eq!(sync.offset_ms, 100);
+        assert_eq!(sync.offset_delta_ms, 0);
+        assert_eq!(sync.last_measured_offset_ms, 100);
+        assert_eq!(sync.last_sync_seq, 1);
+    }
+
+    #[test]
+    fn time_sync_smooths_offset_and_reports_drift() {
+        let mut sync = TimeSync::new(0);
+        sync.apply_sync(1, 1_000, 900); // measured offset = 100
+        sync.apply_sync(2, 2_000, 1_820); // measured offset = 180
+        // EWMA: (100 * 7 + 180) / 8 = 110; drift = 180 - 100 = 80.
+        assert_eq!(sync.offset_ms, 110);
+        assert_eq!(sync.offset_delta_ms, 80);
+        assert_eq!(sync.last_measured_offset_ms, 180);
+    }
+
+    #[test]
+    fn gateway_time_applies_signed_offset() {
+        let mut pos = TimeSync::new(0);
+        pos.apply_sync(1, 1_000, 900); // offset +100
+        assert_eq!(pos.gateway_time_ms(2_000), 2_100);
+
+        let mut neg = TimeSync::new(0);
+        neg.apply_sync(1, 500, 900); // offset -400
+        assert_eq!(neg.gateway_time_ms(1_000), 600);
+        // Saturates instead of underflowing.
+        assert_eq!(neg.gateway_time_ms(100), 0);
+    }
+}
