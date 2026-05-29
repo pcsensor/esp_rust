@@ -79,6 +79,36 @@ impl DemoNode {
         self.phase = NetworkPhase::Joined;
     }
 
+    /// A node may only trust its TDMA slot timing once it holds a valid clock.
+    /// The gateway is the time authority, so it is always synced; every other
+    /// role becomes synced after the first SYNC it applies (`last_sync_seq != 0`).
+    pub fn is_synced(&self) -> bool {
+        self.role == NodeRole::Gateway || self.sync.last_sync_seq != 0
+    }
+
+    /// TDMA discipline gate for reception: once this node has a trustworthy
+    /// (synced) clock, periodic scheduled traffic (DATA/ALARM/HEARTBEAT) is only
+    /// accepted from the role that owns the slot the sender claims to have
+    /// transmitted in (derived from `frame.gateway_time_ms`). Control/bootstrap
+    /// frames are reactive (not slot-bound) and are always accepted; while
+    /// unsynced the local clock is untrustworthy, so everything is accepted.
+    pub fn accepts_frame_slot(&self, frame: &Frame) -> bool {
+        if !self.is_synced() {
+            return true;
+        }
+        match frame.frame_type {
+            FrameType::Hello
+            | FrameType::JoinAck
+            | FrameType::Ack
+            | FrameType::Sync
+            | FrameType::Schedule => return true,
+            _ => {}
+        }
+        let claimed_slot = self.schedule.slot_at(frame.gateway_time_ms);
+        self.schedule
+            .slot_owner_ok(frame.node_role, frame.frame_type, claimed_slot)
+    }
+
     pub fn next_seq(&mut self) -> u16 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
@@ -462,4 +492,73 @@ pub enum AlarmTransition {
     Unchanged,
     Raised,
     Cleared,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DemoNode;
+    use crate::protocol::{Frame, FrameType, Payload};
+    use crate::role::{BROADCAST_ID, DEMO_ZONE_ID, NET_ID, NodeRole};
+
+    fn frame(role: NodeRole, frame_type: FrameType, gateway_time_ms: u64) -> Frame {
+        Frame {
+            net_id: NET_ID,
+            src_id: role.node_id(),
+            dst_id: BROADCAST_ID,
+            node_role: role,
+            zone_id: DEMO_ZONE_ID,
+            frame_type,
+            seq: 1,
+            hop: role.default_hop(),
+            gateway_time_ms,
+            payload: Payload::new(),
+        }
+    }
+
+    #[test]
+    fn gateway_is_synced_immediately() {
+        assert!(DemoNode::new(NodeRole::Gateway).is_synced());
+    }
+
+    #[test]
+    fn relay_and_sensor_are_unsynced_until_first_sync() {
+        let mut node = DemoNode::new(NodeRole::Relay);
+        assert!(!node.is_synced());
+        node.sync.apply_sync(1, 1_000, 900);
+        assert!(node.is_synced());
+    }
+
+    #[test]
+    fn unsynced_node_accepts_any_frame() {
+        let node = DemoNode::new(NodeRole::Relay);
+        // Claims the quiet slot (7); would be rejected once synced.
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Data, 7_200)));
+    }
+
+    #[test]
+    fn synced_node_enforces_slot_for_periodic_traffic() {
+        let mut node = DemoNode::new(NodeRole::Relay);
+        node.sync.apply_sync(1, 1_000, 1_000);
+        // Sensor DATA in the sensor slot (2) is accepted; in the quiet slot (7) dropped.
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Data, 2_300)));
+        assert!(!node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Data, 7_300)));
+    }
+
+    #[test]
+    fn synced_node_always_accepts_control_frames() {
+        let mut node = DemoNode::new(NodeRole::Sensor);
+        node.sync.apply_sync(1, 1_000, 1_000);
+        // SYNC / JOIN_ACK accepted regardless of the slot they claim.
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Gateway, FrameType::Sync, 7_500)));
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Relay, FrameType::JoinAck, 7_500)));
+    }
+
+    #[test]
+    fn alarm_accepted_in_both_data_and_retry_slots() {
+        let mut node = DemoNode::new(NodeRole::Relay);
+        node.sync.apply_sync(1, 1_000, 1_000);
+        // Sensor ALARM: sensor slot (2) for first send, retry slot (4) for retransmit.
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Alarm, 2_300)));
+        assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Alarm, 4_300)));
+    }
 }

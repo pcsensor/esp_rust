@@ -28,7 +28,6 @@ use esp32c3_rust::{
     protocol::{Frame, FrameType},
     relay::RelayForwardBuffer,
     role::{ACTIVE_ROLE, GATEWAY_ID, NodeRole},
-    tdma::TdmaSchedule,
     transport::LoraUartTransport,
 };
 
@@ -121,8 +120,14 @@ async fn run() -> AppResult<()> {
     // SYNC re-broadcast is deferred to the relay control slot instead of being
     // sent inline, so it stays inside the TDMA schedule.
     let mut pending_sync_forward: Option<Frame> = None;
+    // A received ALARM is forwarded by the relay in its own slot (slot 3) rather
+    // than inline on receipt, so the second hop stays inside the TDMA schedule.
+    let mut pending_alarm_forward: Option<Frame> = None;
     let mut gateway_stats = GatewayStats::new();
     let boot = Instant::now();
+    // Tracks the last HELLO send while searching so retries run on a local timer
+    // (decoupled from the unsynchronized clock's arbitrary slot boundaries).
+    let mut last_hello_ms = elapsed_ms(boot);
 
     match ACTIVE_ROLE {
         NodeRole::Gateway => {
@@ -159,6 +164,7 @@ async fn run() -> AppResult<()> {
             &mut pending_ack,
             &mut relay_forward,
             &mut pending_sync_forward,
+            &mut pending_alarm_forward,
             &mut gateway_stats,
         )?;
 
@@ -176,19 +182,28 @@ async fn run() -> AppResult<()> {
             }
         }
 
-        if let Some(local_time_ms) = enter_tx_window(&node, boot).await {
+        // Only follow the TDMA schedule once the clock is trustworthy (synced)
+        // and, for relay/sensor, the node has joined. Until then stay in RX and
+        // retry HELLO on a local timer so an unsynchronized clock never drives
+        // slot-based transmission.
+        let follow_schedule = node.is_synced()
+            && (node.role == NodeRole::Gateway || node.phase == NetworkPhase::Joined);
+
+        if !follow_schedule {
+            if node.phase == NetworkPhase::Searching
+                && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
+                && local_time_ms.saturating_sub(last_hello_ms) >= HELLO_RETRY_INTERVAL_MS
+            {
+                let frame = node.make_hello(local_time_ms)?;
+                let bytes = lora_transport.send_frame(&frame)?;
+                last_hello_ms = local_time_ms;
+                println!(
+                    "{} searching: retry {} seq={} bytes={}",
+                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
+                );
+            }
+        } else if let Some(local_time_ms) = enter_tx_window(&node, boot).await {
             match ACTIVE_ROLE {
-                NodeRole::Relay | NodeRole::Sensor
-                    if node.phase == NetworkPhase::Searching
-                        && slot == hello_retry_slot(node.role, node.schedule) =>
-                {
-                    let frame = node.make_hello(local_time_ms)?;
-                    let bytes = lora_transport.send_frame(&frame)?;
-                    println!(
-                        "{} searching: retry {} seq={} bytes={}",
-                        ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
-                    );
-                }
                 NodeRole::Gateway if slot == node.schedule.sync_slot => {
                     let frame = node.make_sync(local_time_ms)?;
                     let bytes = lora_transport.send_frame(&frame)?;
@@ -378,6 +393,19 @@ async fn run() -> AppResult<()> {
                 NodeRole::Relay
                     if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
                 {
+                    // Second ALARM hop (relay -> gateway) runs here, inside the
+                    // relay slot, instead of inline on receipt — keeping it in the
+                    // TDMA schedule. It carries an ACK and is retried in slot 4.
+                    if let Some(alarm_frame) = pending_alarm_forward.take() {
+                        let forwarded =
+                            node.make_forwarded(&alarm_frame, GATEWAY_ID, local_time_ms)?;
+                        let bytes = lora_transport.send_frame(&forwarded)?;
+                        pending_ack.remember(&forwarded, local_time_ms);
+                        println!(
+                            "relay slot tx ALARM origin_seq={} relay_seq={} ack_required=true bytes={}",
+                            alarm_frame.seq, forwarded.seq, bytes
+                        );
+                    }
                     // Forward up to MAX_FORWARD_PER_SLOT buffered DATA frames so a
                     // backlog drains instead of being overwritten; each is sent
                     // best-effort (repeated) since only ALARM carries an ACK.
@@ -446,6 +474,7 @@ async fn run() -> AppResult<()> {
                 &mut pending_ack,
                 &mut relay_forward,
                 &mut pending_sync_forward,
+                &mut pending_alarm_forward,
                 &mut gateway_stats,
             )?;
         }
@@ -464,14 +493,9 @@ const MAX_FORWARD_PER_SLOT: usize = 2;
 const BEST_EFFORT_TX_REPEATS: u8 = 2;
 /// Spacing between best-effort repeats to decorrelate bursty interference.
 const BEST_EFFORT_REPEAT_GAP_MS: u64 = 40;
-
-fn hello_retry_slot(role: NodeRole, schedule: TdmaSchedule) -> u8 {
-    match role {
-        NodeRole::Gateway => schedule.sync_slot,
-        NodeRole::Relay => schedule.relay_heartbeat_slot,
-        NodeRole::Sensor => schedule.sensor_slot,
-    }
-}
+/// While searching (unsynced), retry HELLO on this local-time cadence rather
+/// than on TDMA slot boundaries, which are meaningless before the clock is set.
+const HELLO_RETRY_INTERVAL_MS: u64 = 2_000;
 
 async fn enter_tx_window(node: &DemoNode, boot: Instant) -> Option<u64> {
     let local_time_ms = elapsed_ms(boot);
@@ -503,6 +527,7 @@ fn service_rx(
     pending_ack: &mut PendingAck,
     relay_forward: &mut RelayForwardBuffer,
     pending_sync_forward: &mut Option<Frame>,
+    pending_alarm_forward: &mut Option<Frame>,
     gateway_stats: &mut GatewayStats,
 ) -> AppResult<()> {
     let local_time_ms = elapsed_ms(boot);
@@ -522,6 +547,7 @@ fn service_rx(
                 pending_ack,
                 relay_forward,
                 pending_sync_forward,
+                pending_alarm_forward,
                 gateway_stats,
             )?,
             Ok(None) => break,
@@ -562,10 +588,25 @@ fn handle_received_frame(
     pending_ack: &mut PendingAck,
     relay_forward: &mut RelayForwardBuffer,
     pending_sync_forward: &mut Option<Frame>,
+    pending_alarm_forward: &mut Option<Frame>,
     gateway_stats: &mut GatewayStats,
 ) -> AppResult<()> {
     #[cfg(not(feature = "gateway-node"))]
     let _ = gateway_alarm_active;
+
+    // TDMA slot-strict reception: once our clock is trusted, drop periodic
+    // scheduled traffic that arrives from a sender outside its assigned slot
+    // instead of acting on out-of-slot (likely unsynchronized) frames.
+    if !node.accepts_frame_slot(frame) {
+        gateway_stats.record_slot_violation();
+        log::warn!(
+            "drop out-of-slot {} from {} claimed_slot={}",
+            frame.frame_type,
+            frame.src_id,
+            node.schedule.slot_at(frame.gateway_time_ms)
+        );
+        return Ok(());
+    }
 
     let action = node.apply_frame(frame, local_time_ms);
 
@@ -725,14 +766,16 @@ fn handle_received_frame(
             },
         ) => {
             if alarm {
+                // First ALARM hop (sensor -> relay): ACK the sensor immediately
+                // so it stops retrying this hop, then buffer the ALARM for the
+                // relay slot rather than forwarding inline. The second hop
+                // (relay -> gateway) and its retries are scheduled in slot 3/4.
                 let ack =
                     node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
                 let ack_bytes = lora_transport.send_frame(&ack)?;
-                let forwarded = node.make_forwarded(frame, GATEWAY_ID, local_time_ms)?;
-                let forward_bytes = lora_transport.send_frame(&forwarded)?;
-                pending_ack.remember(&forwarded, local_time_ms);
+                *pending_alarm_forward = Some(frame.clone());
                 println!(
-                    "rx {} origin={} origin_seq={} from={} temp={}.{:02}C humidity={}.{:02}% alarm=true -> ack_bytes={} relay_seq={} immediate_forward_bytes={}",
+                    "rx {} origin={} origin_seq={} from={} temp={}.{:02}C humidity={}.{:02}% alarm=true -> ack_bytes={} queued_for_relay_slot",
                     frame.frame_type,
                     origin_id,
                     origin_seq,
@@ -741,9 +784,7 @@ fn handle_received_frame(
                     temp_centi_c.unsigned_abs() % 100,
                     humidity_centi_percent / 100,
                     humidity_centi_percent % 100,
-                    ack_bytes,
-                    forwarded.seq,
-                    forward_bytes
+                    ack_bytes
                 );
             } else {
                 relay_forward.remember(frame);

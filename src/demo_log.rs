@@ -46,6 +46,7 @@ pub struct GatewayStats {
     pub rx_data: u32,
     pub rx_alarm: u32,
     pub tx_ack: u32,
+    pub slot_violations: u32,
     pub origin_seq_gap_total: u32,
     pub last_origin_seq: Option<u16>,
     pub last_sync_seq: u16,
@@ -62,6 +63,7 @@ impl GatewayStats {
             rx_data: 0,
             rx_alarm: 0,
             tx_ack: 0,
+            slot_violations: 0,
             origin_seq_gap_total: 0,
             last_origin_seq: None,
             last_sync_seq: 0,
@@ -69,6 +71,11 @@ impl GatewayStats {
             offset_delta_ms: 0,
             last_report_ms: 0,
         }
+    }
+
+    /// Count a frame dropped for transmitting outside its TDMA slot.
+    pub fn record_slot_violation(&mut self) {
+        self.slot_violations = self.slot_violations.saturating_add(1);
     }
 
     pub fn update_sync(&mut self, last_sync_seq: u16, offset_ms: i64, offset_delta_ms: i64) {
@@ -172,11 +179,12 @@ pub fn print_gateway_stats(stats: &GatewayStats, now_ms: u64) {
     println!();
     println!("{}", LINE_THIN);
     println!(
-        "[NET STATS] uptime={} rx_data={} rx_alarm={} tx_ack={} origin_seq_gap_total={} last_sync={} offset={}ms drift={}ms",
+        "[NET STATS] uptime={} rx_data={} rx_alarm={} tx_ack={} slot_violations={} origin_seq_gap_total={} last_sync={} offset={}ms drift={}ms",
         GatewayTime(now_ms),
         stats.rx_data,
         stats.rx_alarm,
         stats.tx_ack,
+        stats.slot_violations,
         stats.origin_seq_gap_total,
         stats.last_sync_seq,
         stats.offset_ms,

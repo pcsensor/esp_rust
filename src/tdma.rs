@@ -1,3 +1,6 @@
+use crate::protocol::FrameType;
+use crate::role::NodeRole;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdmaSchedule {
     pub schedule_version: u8,
@@ -53,6 +56,24 @@ impl TdmaSchedule {
 
     pub const fn next_slot_delay_ms(self, gateway_time_ms: u64) -> u32 {
         self.slot_ms - self.slot_elapsed_ms(gateway_time_ms)
+    }
+
+    /// Whether a periodic scheduled frame of `frame_type` from `role` is allowed
+    /// in `slot`. ALARM spans the owner's data slot and the retry slot because it
+    /// is first sent / forwarded in the data slot and retransmitted in the retry
+    /// slot. Frame types not listed (control/bootstrap) are not slot-constrained.
+    pub fn slot_owner_ok(self, role: NodeRole, frame_type: FrameType, slot: u8) -> bool {
+        match (role, frame_type) {
+            (NodeRole::Sensor, FrameType::Data | FrameType::Alarm) => {
+                slot == self.sensor_slot || slot == self.alarm_retry_slot
+            }
+            (NodeRole::Relay, FrameType::Data | FrameType::Alarm) => {
+                slot == self.relay_slot || slot == self.alarm_retry_slot
+            }
+            (NodeRole::Relay, FrameType::Heartbeat) => slot == self.relay_heartbeat_slot,
+            (NodeRole::Sensor, FrameType::Heartbeat) => slot == self.sensor_heartbeat_slot,
+            _ => true,
+        }
     }
 }
 
@@ -142,6 +163,44 @@ mod tests {
         // Boundaries repeat every slot.
         assert!(!S.is_active_window(1_099));
         assert!(S.is_active_window(1_100));
+    }
+
+    #[test]
+    fn slot_owner_accepts_only_the_assigned_slot() {
+        use crate::protocol::FrameType;
+        use crate::role::NodeRole;
+
+        // Sensor DATA/ALARM is valid in the sensor slot and the retry slot.
+        assert!(S.slot_owner_ok(NodeRole::Sensor, FrameType::Data, S.sensor_slot));
+        assert!(S.slot_owner_ok(NodeRole::Sensor, FrameType::Alarm, S.sensor_slot));
+        assert!(S.slot_owner_ok(NodeRole::Sensor, FrameType::Alarm, S.alarm_retry_slot));
+        assert!(!S.slot_owner_ok(NodeRole::Sensor, FrameType::Data, S.relay_slot));
+
+        // Relay DATA/ALARM is valid in the relay slot and the retry slot.
+        assert!(S.slot_owner_ok(NodeRole::Relay, FrameType::Data, S.relay_slot));
+        assert!(S.slot_owner_ok(NodeRole::Relay, FrameType::Alarm, S.alarm_retry_slot));
+        assert!(!S.slot_owner_ok(NodeRole::Relay, FrameType::Alarm, S.sensor_slot));
+
+        // HEARTBEAT is bound to each role's own heartbeat slot.
+        assert!(S.slot_owner_ok(
+            NodeRole::Relay,
+            FrameType::Heartbeat,
+            S.relay_heartbeat_slot
+        ));
+        assert!(S.slot_owner_ok(
+            NodeRole::Sensor,
+            FrameType::Heartbeat,
+            S.sensor_heartbeat_slot
+        ));
+        assert!(!S.slot_owner_ok(
+            NodeRole::Relay,
+            FrameType::Heartbeat,
+            S.sensor_heartbeat_slot
+        ));
+
+        // Control/bootstrap frame types are not slot-constrained.
+        assert!(S.slot_owner_ok(NodeRole::Gateway, FrameType::Sync, S.quiet_slot));
+        assert!(S.slot_owner_ok(NodeRole::Sensor, FrameType::JoinAck, S.quiet_slot));
     }
 
     #[test]
