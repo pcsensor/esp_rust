@@ -2,111 +2,83 @@ use core::fmt;
 
 use embassy_time::{Duration, Timer};
 use esp_hal::{
-    Blocking,
-    uart::{RxError, TxError, Uart},
+    Async, Blocking,
+    uart::{RxError, TxError, Uart, UartRx, UartTx},
 };
 
 use crate::{
     hardware::DX_LR32_DEMO_AT_SEQUENCE,
-    protocol::{
-        DecodeError, EncodedFrame, Frame, FrameStreamDecoder, MAX_FRAME_LEN, StreamDecodeError,
-    },
+    protocol::{DecodeError, Frame, FrameStreamDecoder, MAX_FRAME_LEN, StreamDecodeError},
 };
 
-pub trait LoraTransport {
-    type Error;
-
-    fn send(&mut self, frame: &Frame) -> Result<usize, Self::Error>;
-    fn receive(&mut self, buffer: &[u8]) -> Result<Option<Frame>, Self::Error>;
+/// Transmit half of the LoRa UART link. Sole owner of `UartTx`, so only one
+/// task ever drives the radio's TX path (no contention). Interrupt-driven async.
+pub struct LoraTx<'d> {
+    uart: UartTx<'d, Async>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryTransportError {
-    Encode,
-    Decode(DecodeError),
-}
-
-pub struct MemoryTransport {
-    last_tx: Option<EncodedFrame>,
-}
-
-pub struct LoraUartTransport<'d> {
-    uart: Uart<'d, Blocking>,
-    decoder: FrameStreamDecoder,
-}
-
-impl<'d> LoraUartTransport<'d> {
-    pub const fn new(uart: Uart<'d, Blocking>) -> Self {
-        Self {
-            uart,
-            decoder: FrameStreamDecoder::new(),
-        }
+impl<'d> LoraTx<'d> {
+    pub const fn new(uart: UartTx<'d, Async>) -> Self {
+        Self { uart }
     }
 
-    pub fn send_frame(&mut self, frame: &Frame) -> Result<usize, LoraUartError> {
+    pub async fn send_frame(&mut self, frame: &Frame) -> Result<usize, LoraUartError> {
         let encoded = frame.encode().map_err(|_| LoraUartError::Encode)?;
-        self.write_all(&encoded)?;
-        self.uart.flush().map_err(LoraUartError::Tx)?;
+        self.write_all(&encoded).await?;
+        self.uart.flush_async().await.map_err(LoraUartError::Tx)?;
         Ok(encoded.len())
     }
 
-    pub fn read_frame(&mut self) -> Result<Option<Frame>, LoraUartError> {
-        let mut buffer = [0u8; MAX_FRAME_LEN];
-        let read = self.uart.read(&mut buffer).map_err(LoraUartError::Rx)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        self.decoder
-            .push_bytes(&buffer[..read])
-            .map_err(LoraUartError::Stream)?;
-        self.decoder.next_frame().map_err(LoraUartError::Stream)
-    }
-
-    /// Drain all available UART bytes into the stream decoder.
-    /// Call this once per poll cycle to avoid RX FIFO overflow.
-    pub fn drain_to_decoder(&mut self) -> Result<(), LoraUartError> {
-        let mut buffer = [0u8; MAX_FRAME_LEN];
-        while self.uart.read_ready() {
-            let read = self.uart.read(&mut buffer).map_err(LoraUartError::Rx)?;
-            if read == 0 {
-                break;
-            }
-            self.decoder
-                .push_bytes(&buffer[..read])
-                .map_err(LoraUartError::Stream)?;
-        }
-        Ok(())
-    }
-
-    /// Pop one complete frame from the decoder buffer, if available.
-    pub fn next_decoded_frame(&mut self) -> Result<Option<Frame>, LoraUartError> {
-        self.decoder.next_frame().map_err(LoraUartError::Stream)
-    }
-
-    fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), LoraUartError> {
+    async fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), LoraUartError> {
         while !bytes.is_empty() {
-            let written = self.uart.write(bytes).map_err(LoraUartError::Tx)?;
+            let written = self
+                .uart
+                .write_async(bytes)
+                .await
+                .map_err(LoraUartError::Tx)?;
             bytes = &bytes[written..];
         }
         Ok(())
     }
 }
 
-impl LoraTransport for LoraUartTransport<'_> {
-    type Error = LoraUartError;
+/// Receive half of the LoRa UART link. Owns the `UartRx` plus the streaming
+/// frame decoder, so RX can be serviced independently of TX timing.
+/// Interrupt-driven async: `read_into_decoder` awaits the next bytes instead of
+/// polling, so frames never age in the hardware FIFO.
+pub struct LoraRx<'d> {
+    uart: UartRx<'d, Async>,
+    decoder: FrameStreamDecoder,
+}
 
-    fn send(&mut self, frame: &Frame) -> Result<usize, Self::Error> {
-        self.send_frame(frame)
+impl<'d> LoraRx<'d> {
+    pub const fn new(uart: UartRx<'d, Async>) -> Self {
+        Self {
+            uart,
+            decoder: FrameStreamDecoder::new(),
+        }
     }
 
-    fn receive(&mut self, buffer: &[u8]) -> Result<Option<Frame>, Self::Error> {
-        if buffer.is_empty() {
-            self.next_decoded_frame()
-        } else {
-            Frame::decode(buffer)
-                .map(Some)
-                .map_err(LoraUartError::Decode)
+    /// Await the next chunk of UART bytes (interrupt-driven) and push it into the
+    /// stream decoder. Returns the number of bytes read.
+    pub async fn read_into_decoder(&mut self) -> Result<usize, LoraUartError> {
+        let mut buffer = [0u8; MAX_FRAME_LEN];
+        let read = self
+            .uart
+            .read_async(&mut buffer)
+            .await
+            .map_err(LoraUartError::Rx)?;
+        if read > 0 {
+            self.decoder
+                .push_bytes(&buffer[..read])
+                .map_err(LoraUartError::Stream)?;
         }
+        Ok(read)
+    }
+
+    /// Pop one complete frame from the decoder buffer, if available.
+    pub fn next_decoded_frame(&mut self) -> Result<Option<Frame>, LoraUartError> {
+        self.decoder.next_frame().map_err(LoraUartError::Stream)
     }
 }
 
@@ -246,41 +218,5 @@ impl fmt::Display for LoraUartError {
             Self::Rx(source) => write!(f, "UART RX failed: {source}"),
             Self::Timeout => f.write_str("AT command timed out"),
         }
-    }
-}
-
-impl MemoryTransport {
-    pub const fn new() -> Self {
-        Self { last_tx: None }
-    }
-
-    pub const fn last_tx(&self) -> Option<&EncodedFrame> {
-        self.last_tx.as_ref()
-    }
-}
-
-impl Default for MemoryTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LoraTransport for MemoryTransport {
-    type Error = MemoryTransportError;
-
-    fn send(&mut self, frame: &Frame) -> Result<usize, Self::Error> {
-        let encoded = frame.encode().map_err(|_| MemoryTransportError::Encode)?;
-        let len = encoded.len();
-        self.last_tx = Some(encoded);
-        Ok(len)
-    }
-
-    fn receive(&mut self, buffer: &[u8]) -> Result<Option<Frame>, Self::Error> {
-        if buffer.is_empty() {
-            return Ok(None);
-        }
-        Frame::decode(buffer)
-            .map(Some)
-            .map_err(MemoryTransportError::Decode)
     }
 }

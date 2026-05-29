@@ -711,6 +711,7 @@ name = "esp32c3-rust"
 version = "0.1.0"
 dependencies = [
  "embassy-executor",
+ "embassy-futures",
  "embassy-sync 0.8.0",
  "embassy-time",
  "esp-backtrace",
