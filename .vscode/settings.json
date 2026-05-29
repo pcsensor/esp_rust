@@ -1,9 +1,9 @@
 {
-    //"rust-analyzer.server.path": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/bin/rust-analyzer",
-    "rust-analyzer.server.path": "/home/pcsensor/.rustup/toolchains/nightly-2026-05-04-x86_64-unknown-linux-gnu/bin/rust-analyzer",
+    "rust-analyzer.server.path": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/bin/rust-analyzer",
+    //"rust-analyzer.server.path": "/home/pcsensor/.rustup/toolchains/nightly-2026-05-04-x86_64-unknown-linux-gnu/bin/rust-analyzer",
     "rust-analyzer.cargo.target": "riscv32imc-unknown-none-elf",
     "rust-analyzer.check.allTargets": false,
-    //"rust-analyzer.procMacro.server": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/libexec/rust-analyzer-proc-macro-srv",
-    "rust-analyzer.procMacro.server": "/home/pcsensor/.rustup/toolchains/nightly-2026-05-04-x86_64-unknown-linux-gnu/libexec/rust-analyzer-proc-macro-srv",
+    "rust-analyzer.procMacro.server": "/Users/pcsensor/.rustup/toolchains/nightly-2026-05-04-aarch64-apple-darwin/libexec/rust-analyzer-proc-macro-srv",
+    //"rust-analyzer.procMacro.server": "/home/pcsensor/.rustup/toolchains/nightly-2026-05-04-x86_64-unknown-linux-gnu/libexec/rust-analyzer-proc-macro-srv",
 
 }

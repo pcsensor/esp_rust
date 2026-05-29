@@ -23,6 +23,7 @@ use esp32c3_rust::sensors::Sht40;
 use esp32c3_rust::{
     AppError, AppResult,
     demo::{AlarmLatch, AlarmTransition, DemoNode, EnvironmentSample, FrameAction, NetworkPhase},
+    demo_log::{self, BuzzerAction, GatewayRxDataLog, GatewayStats},
     hardware::{LoraModuleConfigPlan, LoraUartConfig, PinConfig, Sht40Config},
     protocol::{Frame, FrameType},
     role::{ACTIVE_ROLE, GATEWAY_ID, NodeRole},
@@ -116,6 +117,7 @@ async fn run() -> AppResult<()> {
     let mut sensor_alarm_latch = AlarmLatch::new();
     let mut pending_ack = PendingAck::new();
     let mut relay_forward = RelayForwardBuffer::new();
+    let mut gateway_stats = GatewayStats::new();
     let boot = Instant::now();
 
     match ACTIVE_ROLE {
@@ -161,6 +163,7 @@ async fn run() -> AppResult<()> {
                         &mut gateway_alarm_active,
                         &mut pending_ack,
                         &mut relay_forward,
+                        &mut gateway_stats,
                     )?;
                 }
                 Ok(None) => break,
@@ -171,190 +174,218 @@ async fn run() -> AppResult<()> {
             }
         }
 
-        match ACTIVE_ROLE {
-            NodeRole::Relay | NodeRole::Sensor
-                if node.phase == NetworkPhase::Searching
-                    && slot == hello_retry_slot(node.role, node.schedule) =>
-            {
-                let frame = node.make_hello(local_time_ms)?;
-                let bytes = lora_transport.send_frame(&frame)?;
-                println!(
-                    "{} searching: retry {} seq={} bytes={}",
-                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
-                );
+        #[cfg(feature = "gateway-node")]
+        {
+            let gateway_time_ms = node.sync.gateway_time_ms(elapsed_ms(boot));
+            gateway_stats.update_sync(
+                node.sync.last_sync_seq,
+                node.sync.offset_ms,
+                node.sync.offset_delta_ms,
+            );
+            if gateway_stats.should_report(gateway_time_ms) {
+                demo_log::print_gateway_stats(&gateway_stats, gateway_time_ms);
+                gateway_stats.mark_reported(gateway_time_ms);
             }
-            NodeRole::Gateway if slot == node.schedule.sync_slot => {
-                let frame = node.make_sync(local_time_ms)?;
-                let bytes = lora_transport.send_frame(&frame)?;
-                println!(
-                    "tx {} frame_seq={} sync_seq={} gateway_time={} slot={} bytes={}",
-                    frame.frame_type, frame.seq, node.sync_seq, frame.gateway_time_ms, slot, bytes
-                );
+        }
 
-                #[cfg(feature = "gateway-node")]
+        if let Some(local_time_ms) = enter_tx_window(&node, boot).await {
+            match ACTIVE_ROLE {
+                NodeRole::Relay | NodeRole::Sensor
+                    if node.phase == NetworkPhase::Searching
+                        && slot == hello_retry_slot(node.role, node.schedule) =>
                 {
-                    if !gateway_alarm_active {
-                        buzzer.set_high();
-                    }
-                }
-            }
-            NodeRole::Relay | NodeRole::Sensor
-                if node.phase == NetworkPhase::Joined && slot == node.schedule.alarm_retry_slot =>
-            {
-                if let Some((frame, attempt)) = pending_ack.next_retry(local_time_ms) {
+                    let frame = node.make_hello(local_time_ms)?;
                     let bytes = lora_transport.send_frame(&frame)?;
                     println!(
-                        "{} retry {} seq={} attempt={} bytes={}",
-                        ACTIVE_ROLE, frame.frame_type, frame.seq, attempt, bytes
+                        "{} searching: retry {} seq={} bytes={}",
+                        ACTIVE_ROLE, frame.frame_type, frame.seq, bytes
                     );
-                } else if pending_ack.is_exhausted(local_time_ms) {
-                    if let Some((seq, frame_type)) = pending_ack.drop_exhausted() {
-                        println!(
-                            "{} drop {} seq={} after {} attempts",
-                            ACTIVE_ROLE,
-                            frame_type,
-                            seq,
-                            PendingAck::MAX_ATTEMPTS
-                        );
+                }
+                NodeRole::Gateway if slot == node.schedule.sync_slot => {
+                    let frame = node.make_sync(local_time_ms)?;
+                    let bytes = lora_transport.send_frame(&frame)?;
+                    println!(
+                        "tx {} frame_seq={} sync_seq={} schedule_v={} active={}ms guard_before={}ms gateway_time={} slot={} bytes={}",
+                        frame.frame_type,
+                        frame.seq,
+                        node.sync_seq,
+                        node.schedule.schedule_version,
+                        node.schedule.active_ms,
+                        node.schedule.guard_before_ms,
+                        frame.gateway_time_ms,
+                        slot,
+                        bytes
+                    );
+
+                    #[cfg(feature = "gateway-node")]
+                    {
+                        if !gateway_alarm_active {
+                            buzzer.set_high();
+                        }
                     }
                 }
-            }
-            NodeRole::Relay
-                if node.phase == NetworkPhase::Joined
-                    && slot == node.schedule.relay_heartbeat_slot =>
-            {
-                let frame = node.make_heartbeat(local_time_ms)?;
-                let bytes = lora_transport.send_frame(&frame)?;
-                println!(
-                    "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} bytes={}",
-                    ACTIVE_ROLE,
-                    frame.seq,
-                    node.parent_id,
-                    node.slot_id,
-                    node.schedule.relay_heartbeat_slot,
-                    bytes
-                );
-            }
-            NodeRole::Sensor
-                if node.phase == NetworkPhase::Joined
-                    && slot == node.schedule.sensor_heartbeat_slot =>
-            {
-                let frame = node.make_heartbeat(local_time_ms)?;
-                let bytes = lora_transport.send_frame(&frame)?;
-                println!(
-                    "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} bytes={}",
-                    ACTIVE_ROLE,
-                    frame.seq,
-                    node.parent_id,
-                    node.slot_id,
-                    node.schedule.sensor_heartbeat_slot,
-                    bytes
-                );
-            }
-            NodeRole::Sensor
-                if node.phase == NetworkPhase::Joined && slot == node.schedule.sensor_slot =>
-            {
-                #[cfg(feature = "sensor-node")]
-                let sample = read_environment_sample(&mut sht40).await;
-
-                #[cfg(not(feature = "sensor-node"))]
-                let sample = read_environment_sample().await;
-
-                let alarm_transition = sensor_alarm_latch.update(
-                    sample,
-                    Sht40Config::DEFAULT.temp_alarm_centi_c,
-                    Sht40Config::DEFAULT.humidity_alarm_centi_percent,
-                    Sht40Config::DEFAULT.temp_clear_centi_c,
-                    Sht40Config::DEFAULT.humidity_clear_centi_percent,
-                );
-                let alarm = sensor_alarm_latch.is_active();
-                match alarm_transition {
-                    AlarmTransition::Raised => println!(
-                        "sensor alarm raised: temp={}.{:02}C humidity={}.{:02}% thresholds={}cC/{}c%",
-                        sample.temp_centi_c / 100,
-                        sample.temp_centi_c.unsigned_abs() % 100,
-                        sample.humidity_centi_percent / 100,
-                        sample.humidity_centi_percent % 100,
-                        Sht40Config::DEFAULT.temp_alarm_centi_c,
-                        Sht40Config::DEFAULT.humidity_alarm_centi_percent
-                    ),
-                    AlarmTransition::Cleared => {
-                        if pending_ack.cancel_if_matches(FrameType::Alarm) {
-                            println!("sensor alarm cleared locally: cancel pending ALARM retry");
-                        }
+                NodeRole::Relay | NodeRole::Sensor
+                    if node.phase == NetworkPhase::Joined
+                        && slot == node.schedule.alarm_retry_slot =>
+                {
+                    if let Some((frame, attempt)) = pending_ack.next_retry(local_time_ms) {
+                        let bytes = lora_transport.send_frame(&frame)?;
                         println!(
-                            "sensor alarm cleared: temp={}.{:02}C humidity={}.{:02}% clear_thresholds={}cC/{}c%",
+                            "{} retry {} seq={} attempt={} bytes={}",
+                            ACTIVE_ROLE, frame.frame_type, frame.seq, attempt, bytes
+                        );
+                    } else if pending_ack.is_exhausted(local_time_ms) {
+                        if let Some((seq, frame_type)) = pending_ack.drop_exhausted() {
+                            println!(
+                                "{} drop {} seq={} after {} attempts",
+                                ACTIVE_ROLE,
+                                frame_type,
+                                seq,
+                                PendingAck::MAX_ATTEMPTS
+                            );
+                        }
+                    }
+                }
+                NodeRole::Relay
+                    if node.phase == NetworkPhase::Joined
+                        && slot == node.schedule.relay_heartbeat_slot =>
+                {
+                    let frame = node.make_heartbeat(local_time_ms)?;
+                    let bytes = lora_transport.send_frame(&frame)?;
+                    println!(
+                        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} bytes={}",
+                        ACTIVE_ROLE,
+                        frame.seq,
+                        node.parent_id,
+                        node.slot_id,
+                        node.schedule.relay_heartbeat_slot,
+                        bytes
+                    );
+                }
+                NodeRole::Sensor
+                    if node.phase == NetworkPhase::Joined
+                        && slot == node.schedule.sensor_heartbeat_slot =>
+                {
+                    let frame = node.make_heartbeat(local_time_ms)?;
+                    let bytes = lora_transport.send_frame(&frame)?;
+                    println!(
+                        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} bytes={}",
+                        ACTIVE_ROLE,
+                        frame.seq,
+                        node.parent_id,
+                        node.slot_id,
+                        node.schedule.sensor_heartbeat_slot,
+                        bytes
+                    );
+                }
+                NodeRole::Sensor
+                    if node.phase == NetworkPhase::Joined && slot == node.schedule.sensor_slot =>
+                {
+                    #[cfg(feature = "sensor-node")]
+                    let sample = read_environment_sample(&mut sht40).await;
+
+                    #[cfg(not(feature = "sensor-node"))]
+                    let sample = read_environment_sample().await;
+
+                    let alarm_transition = sensor_alarm_latch.update(
+                        sample,
+                        Sht40Config::DEFAULT.temp_alarm_centi_c,
+                        Sht40Config::DEFAULT.humidity_alarm_centi_percent,
+                        Sht40Config::DEFAULT.temp_clear_centi_c,
+                        Sht40Config::DEFAULT.humidity_clear_centi_percent,
+                    );
+                    let alarm = sensor_alarm_latch.is_active();
+                    match alarm_transition {
+                        AlarmTransition::Raised => println!(
+                            "sensor alarm raised: temp={}.{:02}C humidity={}.{:02}% thresholds={}cC/{}c%",
                             sample.temp_centi_c / 100,
                             sample.temp_centi_c.unsigned_abs() % 100,
                             sample.humidity_centi_percent / 100,
                             sample.humidity_centi_percent % 100,
-                            Sht40Config::DEFAULT.temp_clear_centi_c,
-                            Sht40Config::DEFAULT.humidity_clear_centi_percent
-                        );
+                            Sht40Config::DEFAULT.temp_alarm_centi_c,
+                            Sht40Config::DEFAULT.humidity_alarm_centi_percent
+                        ),
+                        AlarmTransition::Cleared => {
+                            if pending_ack.cancel_if_matches(FrameType::Alarm) {
+                                println!(
+                                    "sensor alarm cleared locally: cancel pending ALARM retry"
+                                );
+                            }
+                            println!(
+                                "sensor alarm cleared: temp={}.{:02}C humidity={}.{:02}% clear_thresholds={}cC/{}c%",
+                                sample.temp_centi_c / 100,
+                                sample.temp_centi_c.unsigned_abs() % 100,
+                                sample.humidity_centi_percent / 100,
+                                sample.humidity_centi_percent % 100,
+                                Sht40Config::DEFAULT.temp_clear_centi_c,
+                                Sht40Config::DEFAULT.humidity_clear_centi_percent
+                            );
+                        }
+                        AlarmTransition::Unchanged => {}
                     }
-                    AlarmTransition::Unchanged => {}
-                }
-                let frame = if alarm {
-                    node.make_alarm(
-                        local_time_ms,
-                        sample.temp_centi_c,
-                        sample.humidity_centi_percent,
-                    )?
-                } else {
-                    node.make_data(
-                        local_time_ms,
-                        sample.temp_centi_c,
-                        sample.humidity_centi_percent,
-                    )?
-                };
-                let bytes = lora_transport.send_frame(&frame)?;
-                pending_ack.remember(&frame, local_time_ms);
-                println!(
-                    "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
-                    frame.frame_type,
-                    frame.seq,
-                    node.parent_id,
-                    sample.temp_centi_c / 100,
-                    sample.temp_centi_c.unsigned_abs() % 100,
-                    sample.humidity_centi_percent / 100,
-                    sample.humidity_centi_percent % 100,
-                    frame.gateway_time_ms,
-                    bytes
-                );
-            }
-            NodeRole::Relay
-                if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
-            {
-                if let Some(frame) = relay_forward.take() {
-                    let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
-                    let bytes = lora_transport.send_frame(&forwarded)?;
-                    pending_ack.remember(&forwarded, local_time_ms);
+                    let frame = if alarm {
+                        node.make_alarm(
+                            local_time_ms,
+                            sample.temp_centi_c,
+                            sample.humidity_centi_percent,
+                        )?
+                    } else {
+                        node.make_data(
+                            local_time_ms,
+                            sample.temp_centi_c,
+                            sample.humidity_centi_percent,
+                        )?
+                    };
+                    let bytes = lora_transport.send_frame(&frame)?;
+                    pending_ack.remember(&frame, local_time_ms);
                     println!(
-                        "relay slot tx buffered {} sensor_seq={} relay_seq={} ack_required={} bytes={}",
+                        "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
                         frame.frame_type,
                         frame.seq,
-                        forwarded.seq,
-                        is_ack_required(forwarded.frame_type),
+                        node.parent_id,
+                        sample.temp_centi_c / 100,
+                        sample.temp_centi_c.unsigned_abs() % 100,
+                        sample.humidity_centi_percent / 100,
+                        sample.humidity_centi_percent % 100,
+                        frame.gateway_time_ms,
                         bytes
                     );
                 }
-                println!(
-                    "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={}",
-                    relay_forward.has_pending(),
-                    pending_ack.has_pending(),
-                    node.parent_id,
-                    node.hop,
-                    node.sync.last_sync_seq,
-                    node.sync.offset_ms
-                );
+                NodeRole::Relay
+                    if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
+                {
+                    if let Some(frame) = relay_forward.take() {
+                        let forwarded = node.make_forwarded(&frame, GATEWAY_ID, local_time_ms)?;
+                        let bytes = lora_transport.send_frame(&forwarded)?;
+                        pending_ack.remember(&forwarded, local_time_ms);
+                        println!(
+                            "relay slot tx buffered {} sensor_seq={} relay_seq={} ack_required={} bytes={}",
+                            frame.frame_type,
+                            frame.seq,
+                            forwarded.seq,
+                            is_ack_required(forwarded.frame_type),
+                            bytes
+                        );
+                    }
+                    println!(
+                        "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={} offset_delta={}ms",
+                        relay_forward.has_pending(),
+                        pending_ack.has_pending(),
+                        node.parent_id,
+                        node.hop,
+                        node.sync.last_sync_seq,
+                        node.sync.offset_ms,
+                        node.sync.offset_delta_ms
+                    );
+                }
+                NodeRole::Gateway if slot == node.schedule.alarm_retry_slot => {}
+                NodeRole::Relay if slot == node.schedule.alarm_retry_slot => {}
+                NodeRole::Sensor if slot == node.schedule.alarm_retry_slot => {}
+                NodeRole::Gateway if slot == node.schedule.quiet_slot => {}
+                NodeRole::Relay if slot == node.schedule.quiet_slot => {}
+                NodeRole::Sensor if slot == node.schedule.quiet_slot => {}
+                _ => {}
             }
-            NodeRole::Gateway if slot == node.schedule.alarm_retry_slot => {}
-            NodeRole::Relay if slot == node.schedule.alarm_retry_slot => {}
-            NodeRole::Sensor if slot == node.schedule.alarm_retry_slot => {}
-            NodeRole::Gateway if slot == node.schedule.quiet_slot => {}
-            NodeRole::Relay if slot == node.schedule.quiet_slot => {}
-            NodeRole::Sensor if slot == node.schedule.quiet_slot => {}
-            _ => {}
         }
 
         let gateway_time_ms = node.sync.gateway_time_ms(elapsed_ms(boot));
@@ -373,6 +404,25 @@ fn hello_retry_slot(role: NodeRole, schedule: TdmaSchedule) -> u8 {
     }
 }
 
+async fn enter_tx_window(node: &DemoNode, boot: Instant) -> Option<u64> {
+    let local_time_ms = elapsed_ms(boot);
+    let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
+    let elapsed = node.schedule.slot_elapsed_ms(gateway_time_ms);
+
+    if elapsed < node.schedule.guard_before_ms {
+        let wait_ms = node.schedule.guard_before_ms - elapsed;
+        Timer::after(Duration::from_millis(wait_ms as u64)).await;
+    }
+
+    let local_time_ms = elapsed_ms(boot);
+    let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
+    if node.schedule.is_active_window(gateway_time_ms) {
+        Some(local_time_ms)
+    } else {
+        None
+    }
+}
+
 fn handle_received_frame(
     node: &mut DemoNode,
     lora_transport: &mut LoraUartTransport<'_>,
@@ -382,6 +432,7 @@ fn handle_received_frame(
     gateway_alarm_active: &mut bool,
     pending_ack: &mut PendingAck,
     relay_forward: &mut RelayForwardBuffer,
+    gateway_stats: &mut GatewayStats,
 ) -> AppResult<()> {
     #[cfg(not(feature = "gateway-node"))]
     let _ = gateway_alarm_active;
@@ -427,43 +478,49 @@ fn handle_received_frame(
                 alarm,
             },
         ) => {
-            println!(
-                "rx {} origin={} origin_seq={} via={} relay_seq={} temp={}.{:02}C humidity={}.{:02}% alarm={} gateway_time={}",
-                frame.frame_type,
-                origin_id,
-                origin_seq,
-                frame.src_id,
-                frame.seq,
-                temp_centi_c / 100,
-                temp_centi_c.unsigned_abs() % 100,
-                humidity_centi_percent / 100,
-                humidity_centi_percent % 100,
-                alarm,
-                frame.gateway_time_ms
-            );
+            let mut ack_seq = None;
             // Only ALARM gets ACK for guaranteed delivery
             if alarm {
                 let ack =
                     node.make_ack(frame.src_id, frame.seq, frame.frame_type, local_time_ms)?;
-                let bytes = lora_transport.send_frame(&ack)?;
-                println!(
-                    "tx ACK seq={} acked_seq={} bytes={}",
-                    ack.seq, frame.seq, bytes
-                );
+                let _bytes = lora_transport.send_frame(&ack)?;
+                ack_seq = Some(ack.seq);
             }
 
+            #[cfg(feature = "gateway-node")]
+            let mut buzzer_action = BuzzerAction::Unchanged;
+            #[cfg(not(feature = "gateway-node"))]
+            let buzzer_action = BuzzerAction::Unchanged;
             #[cfg(feature = "gateway-node")]
             {
                 if alarm {
                     *gateway_alarm_active = true;
                     buzzer.set_low();
-                    println!("alarm active: buzzer on");
+                    buzzer_action = BuzzerAction::On;
                 } else if frame.frame_type == FrameType::Data && *gateway_alarm_active {
                     *gateway_alarm_active = false;
                     buzzer.set_high();
-                    println!("alarm cleared: buzzer off");
+                    buzzer_action = BuzzerAction::Off;
                 }
             }
+
+            let origin_seq_gap =
+                gateway_stats.record_rx_data(frame.frame_type, origin_seq, ack_seq.is_some());
+            demo_log::print_gateway_rx_data(&GatewayRxDataLog {
+                frame_type: frame.frame_type,
+                gateway_time_ms: frame.gateway_time_ms,
+                origin_id,
+                origin_seq,
+                via_id: frame.src_id,
+                relay_seq: frame.seq,
+                hop: frame.hop.saturating_add(1),
+                temp_centi_c,
+                humidity_centi_percent,
+                alarm,
+                ack_seq,
+                buzzer_action,
+                origin_seq_gap,
+            });
         }
         (
             NodeRole::Gateway,
@@ -474,10 +531,8 @@ fn handle_received_frame(
                 sync_seq,
             },
         ) => {
-            println!(
-                "rx HEARTBEAT from={} role={} reported_data_slot={} hop={} sync_seq={}",
-                frame.src_id, frame.node_role, slot_id, hop, sync_seq
-            );
+            demo_log::print_gateway_heartbeat(frame, slot_id, sync_seq);
+            let _ = hop;
         }
         (NodeRole::Relay, FrameType::Hello, _) if frame.node_role == NodeRole::Sensor => {
             let ack = node.make_join_ack(frame.src_id, frame.node_role, local_time_ms)?;

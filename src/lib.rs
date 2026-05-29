@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod demo;
+pub mod demo_log;
 pub mod hardware;
 pub mod protocol;
 pub mod role;

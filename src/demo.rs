@@ -113,8 +113,11 @@ impl DemoNode {
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
             payload: protocol::sync_payload(
                 self.sync_seq,
+                self.schedule.schedule_version,
                 self.schedule.superframe_ms,
                 self.schedule.slot_ms,
+                self.schedule.guard_before_ms,
+                self.schedule.active_ms,
             )?,
         })
     }
@@ -285,11 +288,20 @@ impl DemoNode {
                 if self.role == NodeRole::Gateway {
                     return FrameAction::Ignore;
                 }
-                if let Some((sync_seq, superframe_ms, slot_ms)) =
-                    protocol::decode_sync_payload(&frame.payload)
+                if let Some((
+                    sync_seq,
+                    schedule_version,
+                    superframe_ms,
+                    slot_ms,
+                    guard_before_ms,
+                    active_ms,
+                )) = protocol::decode_sync_payload(&frame.payload)
                 {
+                    self.schedule.schedule_version = schedule_version;
                     self.schedule.superframe_ms = superframe_ms;
                     self.schedule.slot_ms = slot_ms;
+                    self.schedule.guard_before_ms = guard_before_ms;
+                    self.schedule.active_ms = active_ms;
                     self.sync
                         .apply_sync(sync_seq, frame.gateway_time_ms, local_time_ms);
                     FrameAction::Synced {

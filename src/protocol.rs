@@ -315,13 +315,19 @@ pub fn join_ack_payload(parent_id: u8, hop: u8, slot_id: u8) -> Result<Payload, 
 
 pub fn sync_payload(
     sync_seq: u16,
+    schedule_version: u8,
     superframe_ms: u32,
     slot_ms: u32,
+    guard_before_ms: u32,
+    active_ms: u32,
 ) -> Result<Payload, EncodeError> {
     let mut payload = Payload::new();
     extend_payload(&mut payload, &sync_seq.to_le_bytes())?;
+    push(&mut payload, schedule_version)?;
     extend_payload(&mut payload, &superframe_ms.to_le_bytes())?;
     extend_payload(&mut payload, &slot_ms.to_le_bytes())?;
+    extend_payload(&mut payload, &(guard_before_ms as u16).to_le_bytes())?;
+    extend_payload(&mut payload, &(active_ms as u16).to_le_bytes())?;
     Ok(payload)
 }
 
@@ -361,14 +367,17 @@ pub fn decode_join_ack_payload(payload: &[u8]) -> Option<(u8, u8, u8)> {
     Some((payload[0], payload[1], payload[2]))
 }
 
-pub fn decode_sync_payload(payload: &[u8]) -> Option<(u16, u32, u32)> {
-    if payload.len() < 10 {
+pub fn decode_sync_payload(payload: &[u8]) -> Option<(u16, u8, u32, u32, u32, u32)> {
+    if payload.len() < 15 {
         return None;
     }
     Some((
         u16::from_le_bytes([payload[0], payload[1]]),
-        u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]),
-        u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]),
+        payload[2],
+        u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]),
+        u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]),
+        u16::from_le_bytes([payload[11], payload[12]]) as u32,
+        u16::from_le_bytes([payload[13], payload[14]]) as u32,
     ))
 }
 

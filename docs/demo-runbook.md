@@ -54,7 +54,7 @@ DX-LR32: AT+OPENKEY0 -> OK
 DX-LR32: exited AT mode, module rebooting
 role=gateway node_id=1 default_slot=0 hop=0
 gateway online: broadcasting SYNC/SCHEDULE every TDMA superframe
-tx SYNC frame_seq=... sync_seq=1 gateway_time=... slot=0 bytes=...
+tx SYNC frame_seq=... sync_seq=1 schedule_v=1 active=700ms guard_before=100ms gateway_time=... slot=0 bytes=...
 ```
 
 如果模块未进入 AT 模式，也可以接受以下日志，表示固件继续使用模块现有配置：
@@ -78,21 +78,60 @@ topology: sensor(3) -> relay(2) -> gateway(1)  hop=1
 正常数据上报时应看到：
 
 ```text
-rx DATA origin=3 origin_seq=... via=2 relay_seq=... temp=26.61C humidity=51.45% alarm=false gateway_time=...
+==============================================================
+[RX DATA] gateway_time=00:01:23.000
+--------------------------------------------------------------
+source      : node 3 (sensor), seq=...
+via         : node 2 (relay),  seq=...
+hop         : 2
+temperature : 26.61 C
+humidity    : 51.45 %
+alarm       : NO
+link        : via relay, crc ok
+action      : buzzer unchanged
+==============================================================
 ```
 
 告警时应看到：
 
 ```text
-rx ALARM origin=3 origin_seq=... via=2 relay_seq=... temp=31.20C humidity=85.00% alarm=true gateway_time=...
-alarm active: buzzer on
+==============================================================
+[RX ALARM] gateway_time=00:03:31.000
+--------------------------------------------------------------
+source      : node 3 (sensor), seq=...
+via         : node 2 (relay),  seq=...
+hop         : 2
+temperature : 31.20 C
+humidity    : 85.00 %
+alarm       : YES
+link        : via relay, crc ok
+action      : tx ACK seq=..., buzzer ON
+==============================================================
 ```
 
 恢复后应看到：
 
 ```text
-rx DATA origin=3 origin_seq=... via=2 relay_seq=... alarm=false ...
-alarm cleared: buzzer off
+==============================================================
+[RX DATA] gateway_time=00:03:39.000
+--------------------------------------------------------------
+source      : node 3 (sensor), seq=...
+via         : node 2 (relay),  seq=...
+hop         : 2
+temperature : 28.90 C
+humidity    : 70.00 %
+alarm       : NO
+link        : via relay, crc ok
+action      : buzzer OFF
+==============================================================
+```
+
+网关每 30 秒会额外输出一次统计，用于答辩时解释网络运行状态和时间同步效果：
+
+```text
+--------------------------------------------------------------
+[NET STATS] uptime=00:04:00.000 rx_data=24 rx_alarm=2 tx_ack=2 origin_seq_gap_total=0 last_sync=34 offset=3ms drift=0ms
+--------------------------------------------------------------
 ```
 
 ### 中继
@@ -120,7 +159,7 @@ forward sensor HELLO to gateway: src=3 hop=1 bytes=...
 
 ```text
 rx DATA origin=3 origin_seq=... from=3 temp=26.61C humidity=51.45% -> buffered_for_relay_slot
-relay slot active: buffered_data=... pending_ack=... parent=... hop=1 sync_seq=... offset_ms=...
+relay slot active: buffered_data=... pending_ack=... parent=... hop=1 sync_seq=... offset_ms=... offset_delta=...ms
 relay slot tx buffered DATA sensor_seq=... relay_seq=... ack_required=false bytes=...
 ```
 
@@ -176,8 +215,10 @@ sensor alarm cleared: temp=28.90C humidity=70.00% clear_thresholds=2900cC/7500c%
 
 - 固件启动时尝试通过 AT 命令关闭模块密钥（`AT+OPENKEY0`）；如果没有 `Entry AT` 响应，会保留现有透明模式配置继续演示。其余参数（信道、速率等级等）沿用模块出厂默认值或人工配置值。
 - 当前可靠传输是单帧 `ALARM` pending-ACK 窗口（最多重传 3 次），普通 `DATA/HEARTBEAT` 是周期性最佳努力发送。
-- 超帧周期 8 s，每个 slot 1 s，共 8 个 slot。现场可按 LoRa 空口延迟调整。
+- 超帧周期 8 s，每个 slot 1 s，共 8 个 slot；每个 slot 为 100 ms 前置 Guard、700 ms Active 发送窗口、200 ms 后置 Guard。现场可按 LoRa 空口延迟调整。
 - `sync_seq` 是独立同步序号，不等于普通 frame `seq`；ACK、DATA、HEARTBEAT 不会造成 `sync_seq` 跳号。
+- `SYNC` payload 会下发 `schedule_version`、`superframe_ms`、`slot_ms`、`guard_before_ms` 和 `active_ms`，中继和传感节点跟随网关调度参数。
+- `offset_delta` 是相邻两次 SYNC 测得 offset 的变化量，用于观察轻量时钟漂移补偿效果。
 - 告警使用回差：触发阈值为 30.00 C / 80.00%，解除阈值为 29.00 C / 75.00%。
 
 ## TDMA Slot 表
@@ -197,13 +238,13 @@ sensor alarm cleared: temp=28.90C humidity=70.00% clear_thresholds=2900cC/7500c%
 
 网关 `DATA/ALARM` 日志同时包含：
 
-- `origin`：原始传感节点 ID，三节点 demo 中应为 `3`。
-- `origin_seq`：传感节点生成数据时的原始序号。
-- `via`：网关实际收到的上一跳，三节点 demo 中应为中继 `2`。
-- `relay_seq`：中继转发时生成的新序号。
+- `source`：原始传感节点 ID 和传感节点生成数据时的原始序号。
+- `via`：网关实际收到的上一跳和中继转发时生成的新序号，三节点 demo 中上一跳应为中继 `2`。
+- `link`：当前表示 LoRa 帧 CRC 校验通过；DX-LR32 透明串口模式下暂不提供 RSSI/SNR。
+- `origin_seq_gap_total`：网关统计到的原始序号异常跳变累计值。传感节点每个超帧还会发送 `HEARTBEAT`，所以相邻 DATA/ALARM 原始序号差值为 2 属于正常情况，只有大于 2 才计入 gap。
 
 判断方法：
 
-- 中继日志出现某个 `origin_seq`，网关没有对应 `origin_seq`：大概率是 `relay -> gateway` 丢包。
+- 中继日志出现某个 `origin_seq`，网关没有对应 `source seq`：大概率是 `relay -> gateway` 丢包。
 - 传感节点日志出现某个 `tx DATA/ALARM seq`，中继没有对应 `origin_seq`：大概率是 `sensor -> relay` 丢包。
-- 网关 `origin_seq` 连续但 `relay_seq` 跳号：说明中继还发送了其他帧，例如 `SYNC/HEARTBEAT/ACK`，不是 DATA 丢包。
+- 网关 `source seq` 正常但 `via seq` 跳号：说明中继还发送了其他帧，例如 `SYNC/HEARTBEAT/ACK`，不是 DATA 丢包。

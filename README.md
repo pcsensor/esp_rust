@@ -52,15 +52,16 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 
 - 统一 LoRa 帧格式：`HELLO`、`JOIN_ACK`、`SYNC/SCHEDULE`、`DATA`、`ALARM`、`ACK`、`HEARTBEAT`，带 CRC16。
 - 三节点固定演示拓扑：网关只接纳中继节点入网，中继只接纳传感节点入网，保证答辩时稳定展示 `sensor -> relay -> gateway`。
-- 简化 TDMA 参数：8 s 超帧、8 个 1 s slot。
-- FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新；`sync_seq` 与普通 frame `seq` 分离，避免 ACK/DATA 导致同步序号跳号。
+- 简化 TDMA 参数：8 s 超帧、8 个 1 s slot；每个 slot 拆成 100 ms 前置 Guard、700 ms Active 发送窗口、200 ms 后置 Guard。
+- FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新；`sync_seq` 与普通 frame `seq` 分离，避免 ACK/DATA 导致同步序号跳号；日志打印 `offset_delta_ms` 用于观察轻量漂移补偿效果。
 - DX-LR32 UART transport：通过 UART1 发送编码后的帧。
 - LoRa UART 接收轮询：主循环使用 `read_ready()` 非阻塞检查串口；transport 内部带流式组帧缓存，可处理半帧、粘包和前导噪声字节。网关/中继/传感节点会按角色处理 `HELLO`、`JOIN_ACK`、`SYNC`、`DATA`、`ALARM`、`ACK`。
-- `DATA/ALARM` payload 携带 `origin_id` 和 `origin_seq`；中继转发后网关会同时打印原始传感节点序号和中继转发序号，便于判断丢包发生在哪一跳。
+- `DATA/ALARM` payload 携带 `origin_id` 和 `origin_seq`；中继转发后网关会以答辩演示日志打印原始传感节点序号、中继转发序号、温湿度、告警状态、ACK/蜂鸣器动作，便于判断丢包发生在哪一跳。
 - 在线心跳与确认：`DATA` 和 `HEARTBEAT` 为周期性最佳努力发送，不 ACK；`ALARM` 使用跳到跳 ACK，传感节点等中继 ACK，中继等网关 ACK，未确认时在告警重传 slot 最多重传 3 次。
 - SHT40 读取：传感节点通过 I2C0 读取温湿度，CRC8 校验失败或 I2C 失败时退回演示样本。
 - 告警回差：温度 >= 30.00 C 或湿度 >= 80.00% 触发 `ALARM`；恢复到温度 < 29.00 C 且湿度 < 75.00% 后才解除，避免蜂鸣器在阈值附近抖动。
 - 网关蜂鸣器：GPIO10 默认高电平关闭；收到 `ALARM` 后拉低响铃，后续收到普通 `DATA` 时解除告警并关闭蜂鸣器。
+- 网关演示统计：每 30 s 打印 `rx_data`、`rx_alarm`、`tx_ack`、`origin_seq_gap_total`、`last_sync`、`offset` 和 `drift`，用于现场解释可靠性与时间同步状态。
 
 当前 TDMA slot 分配：
 
@@ -74,6 +75,8 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 | 5 | 5-6 s | 中继 `HEARTBEAT` |
 | 6 | 6-7 s | 传感节点 `HEARTBEAT` |
 | 7 | 7-8 s | 静默/现场观察/后续配置预留 |
+
+每个 slot 的发送规则：节点只在 Active 窗口内首发或重传，Guard 时间只接收不主动发送。网关会在 `SYNC` payload 中下发 `schedule_version`、`superframe_ms`、`slot_ms`、`guard_before_ms` 和 `active_ms`，中继和传感节点收到后跟随更新。
 
 当前仍需继续完成的部分：
 
