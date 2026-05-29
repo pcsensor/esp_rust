@@ -66,7 +66,7 @@ async fn run() -> AppResult<()> {
     let lora = LoraUartConfig::DEMO_DEFAULT;
     let lora_plan = LoraModuleConfigPlan::DX_LR32_DEMO;
     println!(
-        "lora uart: tx=GPIO{} rx=GPIO{} baud={} channel={} freq={}MHz air_rate={}bps tx_power={}dBm net_id=0x{:04x}",
+        "lora uart: tx=GPIO{} rx=GPIO{} baud={} channel={} freq={}MHz air_rate={}bps tx_power={}dBm packet={}B net_id=0x{:04x}",
         pins.lora_uart_tx,
         pins.lora_uart_rx,
         lora.baudrate,
@@ -74,6 +74,7 @@ async fn run() -> AppResult<()> {
         lora.frequency_mhz,
         lora.air_rate_bps,
         lora.tx_power_dbm,
+        lora.packet_bytes,
         lora.net_id
     );
     println!(

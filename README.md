@@ -46,7 +46,7 @@ cargo run --release --no-default-features --features sensor-node
 | SHT40 SCL | GPIO4 | 仅传感节点使用 |
 | 有源蜂鸣器 | GPIO10 | 仅网关节点使用，低电平响 |
 
-LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz、channel 0、空中速率 2148 bps、发射功率 22 dBm、NetID `0x4331`。当前代码启动时会尝试进入 AT 模式发送 `AT+OPENKEY0` 关闭密钥校验；如果模块没有返回 `Entry AT`，固件会降级为沿用已有透明传输配置继续运行。
+LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz、channel 0、空中速率 2148 bps、发射功率 22 dBm、分包长度 64 bytes、NetID `0x4331`。当前代码启动时会尝试进入 AT 模式并按手册发送完整运行配置：透明传输 `AT+MODE0`、高时效模式 `AT+SLEEP2`、关闭 M0/M1 硬件切换 `AT+SWITCH0`、关闭模块密钥 `AT+OPENKEY0`、关闭数据包 RSSI `AT+DRSSI0`、关闭 LBT `AT+LBT0`，以及固定波特率/校验位/信道/速率/功率/分包长度；如果模块没有返回 `Entry AT`，固件会降级为沿用已有透明传输配置继续运行。所有 AT 命令都以 `\r\n` 结尾。
 
 当前已实现的工程代码：
 
@@ -82,7 +82,7 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 
 - 中继转发、告警 ACK 和蜂鸣器联动已接入代码路径，仍需要三块板实测确认 DX-LR32 空口/串口时序、实际延迟和 1 s slot 长度。
 - 可靠传输当前是 demo 级单帧 ALARM pending-ACK 窗口；如果现场需要更高吞吐，再扩展为队列和按帧类型优先级调度。
-- DX-LR32 的运行时配置只发送 `AT+OPENKEY0`，其余参数沿用默认或人工配置；当前代码已把配置计划集中到 `src/hardware.rs` 并在启动日志中打印，便于人工核对。
+- DX-LR32 的运行时配置已集中到 `src/hardware.rs`，启动时显式固定 UART、透明传输、速率等级、工作模式、信道、分包、RSSI、功率、LBT 和密钥开关，并在启动日志中打印，便于人工核对。
 
 现场三节点联调步骤见 [docs/demo-runbook.md](docs/demo-runbook.md)。
 
