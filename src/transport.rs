@@ -139,7 +139,7 @@ pub async fn configure_dx_lr32_module(uart: &mut Uart<'_, Blocking>) -> Result<(
         Err(e) => return Err(e),
     }
 
-    for cmd in config_cmds.iter().copied().filter(|cmd| *cmd != "+++") {
+    for cmd in config_cmds.iter().copied().filter(|cmd| !is_at_escape(cmd)) {
         write_all_raw(uart, cmd.as_bytes())?;
         match read_until(uart, b"OK", 2_000).await {
             Ok(..) => log::info!("DX-LR32: {} -> OK", cmd),
@@ -150,9 +150,12 @@ pub async fn configure_dx_lr32_module(uart: &mut Uart<'_, Blocking>) -> Result<(
         }
     }
 
-    if DX_LR32_DEMO_AT_SEQUENCE.last() == Some(&"+++") {
+    if DX_LR32_DEMO_AT_SEQUENCE
+        .last()
+        .is_some_and(|cmd| is_at_escape(cmd))
+    {
         Timer::after(Duration::from_millis(1_000)).await;
-        write_all_raw(uart, b"+++")?;
+        write_all_raw(uart, DX_LR32_DEMO_AT_SEQUENCE.last().unwrap().as_bytes())?;
         Timer::after(Duration::from_millis(1_500)).await;
         log::info!("DX-LR32: exited AT mode, module rebooting");
     }
@@ -169,6 +172,10 @@ pub fn drain_uart(uart: &mut Uart<'_, Blocking>) {
 }
 
 // -- internal helpers --
+
+fn is_at_escape(cmd: &str) -> bool {
+    cmd.trim_end_matches(['\r', '\n']) == "+++"
+}
 
 fn write_all_raw(uart: &mut Uart<'_, Blocking>, mut bytes: &[u8]) -> Result<(), LoraUartError> {
     while !bytes.is_empty() {

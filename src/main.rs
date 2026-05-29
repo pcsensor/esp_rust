@@ -25,7 +25,7 @@ use esp32c3_rust::{
     demo::{AlarmLatch, AlarmTransition, DemoNode, EnvironmentSample, FrameAction, NetworkPhase},
     demo_log::{self, BuzzerAction, GatewayRxDataLog, GatewayStats},
     hardware::{LoraModuleConfigPlan, LoraUartConfig, PinConfig, Sht40Config},
-    protocol::{Frame, FrameType},
+    protocol::{self, Frame, FrameType},
     relay::RelayForwardBuffer,
     role::{ACTIVE_ROLE, GATEWAY_ID, NodeRole},
     transport::LoraUartTransport,
@@ -399,11 +399,12 @@ async fn run() -> AppResult<()> {
                     if let Some(alarm_frame) = pending_alarm_forward.take() {
                         let forwarded =
                             node.make_forwarded(&alarm_frame, GATEWAY_ID, local_time_ms)?;
+                        let origin_seq = origin_seq(&alarm_frame);
                         let bytes = lora_transport.send_frame(&forwarded)?;
                         pending_ack.remember(&forwarded, local_time_ms);
                         println!(
                             "relay slot tx ALARM origin_seq={} relay_seq={} ack_required=true bytes={}",
-                            alarm_frame.seq, forwarded.seq, bytes
+                            origin_seq, forwarded.seq, bytes
                         );
                     }
                     // Forward up to MAX_FORWARD_PER_SLOT buffered DATA frames so a
@@ -421,12 +422,13 @@ async fn run() -> AppResult<()> {
                             BEST_EFFORT_TX_REPEATS,
                         )
                         .await?;
+                        let origin_seq = origin_seq(&frame);
                         pending_ack.remember(&forwarded, local_time_ms);
                         forwarded_count += 1;
                         println!(
-                            "relay slot tx buffered {} sensor_seq={} relay_seq={} ack_required={} bytes={}",
+                            "relay slot tx buffered {} origin_seq={} relay_seq={} ack_required={} bytes={}",
                             frame.frame_type,
-                            frame.seq,
+                            origin_seq,
                             forwarded.seq,
                             is_ack_required(forwarded.frame_type),
                             bytes
@@ -940,6 +942,12 @@ fn is_ack_required(frame_type: FrameType) -> bool {
     // Only ALARM needs guaranteed delivery with ACK/retry.
     // DATA and HEARTBEAT are periodic best-effort — one lost is acceptable.
     matches!(frame_type, FrameType::Alarm)
+}
+
+fn origin_seq(frame: &Frame) -> u16 {
+    protocol::decode_data_payload(&frame.payload)
+        .map(|(_, origin_seq, _, _)| origin_seq)
+        .unwrap_or(frame.seq)
 }
 
 #[cfg(feature = "sensor-node")]

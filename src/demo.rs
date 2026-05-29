@@ -48,6 +48,7 @@ pub struct DemoNode {
     pub hop: u8,
     pub slot_id: u8,
     pub seq: u16,
+    pub data_seq: u16,
     pub heartbeat_seq: u16,
     pub sync_seq: u16,
     pub phase: NetworkPhase,
@@ -65,6 +66,7 @@ impl DemoNode {
             hop: role.default_hop(),
             slot_id: role.default_slot(),
             seq: 0,
+            data_seq: 0,
             heartbeat_seq: 0,
             sync_seq: 0,
             phase: NetworkPhase::Searching,
@@ -114,8 +116,15 @@ impl DemoNode {
         self.seq
     }
 
-    /// HEARTBEAT uses its own sequence space so periodic DATA/ALARM origin
-    /// sequence numbers stay strictly consecutive, keeping gap accounting exact.
+    /// DATA/ALARM origin sequence uses its own sequence space so bootstrap and
+    /// control frames do not make the first sensor sample appear as seq=2.
+    pub fn next_data_seq(&mut self) -> u16 {
+        self.data_seq = self.data_seq.wrapping_add(1);
+        self.data_seq
+    }
+
+    /// HEARTBEAT uses its own sequence space so DATA/ALARM origin sequence
+    /// numbers stay strictly consecutive, keeping gap accounting exact.
     pub fn next_heartbeat_seq(&mut self) -> u16 {
         self.heartbeat_seq = self.heartbeat_seq.wrapping_add(1);
         self.heartbeat_seq
@@ -191,6 +200,7 @@ impl DemoNode {
         humidity_centi_percent: u16,
     ) -> AppResult<Frame> {
         let seq = self.next_seq();
+        let origin_seq = self.next_data_seq();
         Ok(Frame {
             net_id: NET_ID,
             src_id: self.role.node_id(),
@@ -203,7 +213,7 @@ impl DemoNode {
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
             payload: protocol::data_payload(
                 self.role.node_id(),
-                seq,
+                origin_seq,
                 temp_centi_c,
                 humidity_centi_percent,
             )?,
@@ -217,6 +227,7 @@ impl DemoNode {
         humidity_centi_percent: u16,
     ) -> AppResult<Frame> {
         let seq = self.next_seq();
+        let origin_seq = self.next_data_seq();
         Ok(Frame {
             net_id: NET_ID,
             src_id: self.role.node_id(),
@@ -229,7 +240,7 @@ impl DemoNode {
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
             payload: protocol::data_payload(
                 self.role.node_id(),
-                seq,
+                origin_seq,
                 temp_centi_c,
                 humidity_centi_percent,
             )?,
@@ -497,7 +508,7 @@ pub enum AlarmTransition {
 #[cfg(test)]
 mod tests {
     use super::DemoNode;
-    use crate::protocol::{Frame, FrameType, Payload};
+    use crate::protocol::{self, Frame, FrameType, Payload};
     use crate::role::{BROADCAST_ID, DEMO_ZONE_ID, NET_ID, NodeRole};
 
     fn frame(role: NodeRole, frame_type: FrameType, gateway_time_ms: u64) -> Frame {
@@ -560,5 +571,31 @@ mod tests {
         // Sensor ALARM: sensor slot (2) for first send, retry slot (4) for retransmit.
         assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Alarm, 2_300)));
         assert!(node.accepts_frame_slot(&frame(NodeRole::Sensor, FrameType::Alarm, 4_300)));
+    }
+
+    #[test]
+    fn data_origin_seq_is_independent_from_control_frame_seq() {
+        let mut node = DemoNode::new(NodeRole::Sensor);
+
+        assert_eq!(node.make_hello(0).unwrap().seq, 1);
+        let data = node.make_data(1_000, 2_500, 4_000).unwrap();
+        let (_origin_id, origin_seq, _temp, _humidity) =
+            protocol::decode_data_payload(&data.payload).unwrap();
+
+        assert_eq!(data.seq, 2);
+        assert_eq!(origin_seq, 1);
+    }
+
+    #[test]
+    fn data_and_alarm_share_consecutive_origin_sequence() {
+        let mut node = DemoNode::new(NodeRole::Sensor);
+        let data = node.make_data(1_000, 2_500, 4_000).unwrap();
+        let alarm = node.make_alarm(2_000, 3_100, 8_100).unwrap();
+
+        let (_, data_origin_seq, _, _) = protocol::decode_data_payload(&data.payload).unwrap();
+        let (_, alarm_origin_seq, _, _) = protocol::decode_data_payload(&alarm.payload).unwrap();
+
+        assert_eq!(data_origin_seq, 1);
+        assert_eq!(alarm_origin_seq, 2);
     }
 }

@@ -84,9 +84,9 @@ pub enum LoraModuleConfigMode {
 /// All three modules share the same factory defaults, but the encryption key may
 /// differ.  We disable key verification so any module can talk to any other.
 /// AT command sequence — each entry is sent verbatim over UART.
-/// `+++` is sent bare; AT commands include the required `\r\n` terminator
-/// per the DX-LR32 manual §4.1.
-pub const DX_LR32_DEMO_AT_SEQUENCE: &[&str] = &["+++", "AT+OPENKEY0\r\n", "+++"];
+/// Some DX-LR32 firmware builds accept bare `+++`, while others expect the
+/// UART command terminator as well, so keep CRLF on the escape sequence too.
+pub const DX_LR32_DEMO_AT_SEQUENCE: &[&str] = &["+++\r\n", "AT+OPENKEY0\r\n", "+++\r\n"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoraModuleConfigPlan {

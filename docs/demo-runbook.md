@@ -241,7 +241,7 @@ sensor alarm cleared: temp=28.90C humidity=70.00% clear_thresholds=2900cC/7500c%
 - `source`：原始传感节点 ID 和传感节点生成数据时的原始序号。
 - `via`：网关实际收到的上一跳和中继转发时生成的新序号，三节点 demo 中上一跳应为中继 `2`。
 - `link`：当前表示 LoRa 帧 CRC 校验通过；DX-LR32 透明串口模式下暂不提供 RSSI/SNR。
-- `origin_seq_gap_total`：网关统计到的原始序号异常跳变累计值。传感节点每个超帧还会发送 `HEARTBEAT`，所以相邻 DATA/ALARM 原始序号差值为 2 属于正常情况，只有大于 2 才计入 gap。
+- `origin_seq_gap_total`：网关统计到的原始序号异常跳变累计值。`DATA/ALARM` 使用独立的原始数据序号，`HELLO`、`ACK`、`HEARTBEAT` 等控制帧不会消耗它；相邻 `DATA/ALARM` 原始序号应差 1，大于 1 才计入 gap。
 
 判断方法：
 
