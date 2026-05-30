@@ -1,24 +1,41 @@
+//! Shared logic for the ESP32-C3 LoRa pipe-network demo.
+//!
+//! The library keeps protocol, TDMA, relay buffering, and demo state-machine
+//! code hardware-independent so it can be unit tested on the host. ESP HAL
+//! modules are compiled only for the embedded target.
+
 // Stay `no_std` on the embedded target; on the host (unit tests) keep `std` so
 // the default test harness links.
 #![cfg_attr(target_os = "none", no_std)]
 
+/// Hardware-independent demo state machine and payload actions.
 pub mod demo;
+/// Structured serial log helpers for the demo firmware.
 pub mod demo_log;
+/// Binary frame encoding, decoding, payload helpers, and stream recovery.
 pub mod protocol;
+/// Relay store-and-forward buffering.
 pub mod relay;
+/// Node roles, IDs, and compile-time role feature selection.
 pub mod role;
+/// TDMA schedule and gateway-time synchronization helpers.
 pub mod tdma;
 
 // HAL-bound modules only exist on the embedded target.
 #[cfg(target_os = "none")]
+/// ESP32-C3 pin and peripheral configuration.
 pub mod hardware;
 #[cfg(target_os = "none")]
+/// Sensor drivers and sensor configuration.
 pub mod sensors;
 #[cfg(target_os = "none")]
+/// LoRa UART transport and module configuration.
 pub mod transport;
 
+/// Result type used by shared demo logic.
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Application-level errors surfaced by shared and firmware code.
 #[derive(Debug)]
 pub enum AppError {
     InvalidRoleFeatureSet,

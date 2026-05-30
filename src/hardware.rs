@@ -1,3 +1,5 @@
+//! Hardware pin maps and peripheral configuration constants for the demo.
+
 use crate::role::NodeRole;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

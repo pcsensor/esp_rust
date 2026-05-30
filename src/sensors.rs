@@ -1,3 +1,5 @@
+//! SHT40 sensor driver used by the sensor-node firmware.
+
 use core::fmt;
 
 use embassy_time::{Duration, Timer};

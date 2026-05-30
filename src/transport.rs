@@ -1,3 +1,5 @@
+//! LoRa UART transport and DX-LR32 module setup.
+
 use core::fmt;
 
 use embassy_time::{Duration, Timer};

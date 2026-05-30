@@ -1,3 +1,8 @@
+//! Structured serial logging helpers for the gateway demo output.
+//!
+//! The formatting is kept in one place so protocol handling can report compact
+//! events without carrying presentation details.
+
 use crate::protocol::{Frame, FrameType};
 // On the embedded target `println!` comes from esp-println; on the host it comes
 // from the std prelude, so the logging helpers compile in both environments.

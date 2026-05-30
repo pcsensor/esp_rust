@@ -1,3 +1,5 @@
+//! Bounded relay buffering for scheduled store-and-forward DATA traffic.
+
 use heapless::Deque;
 
 use crate::protocol::Frame;

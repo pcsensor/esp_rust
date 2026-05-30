@@ -1,6 +1,13 @@
+//! TDMA slot schedule and gateway-time synchronization.
+//!
+//! Nodes use the gateway clock as the common timebase. The schedule helpers are
+//! pure arithmetic so both firmware and host-side tests can enforce slot
+//! ownership consistently.
+
 use crate::protocol::FrameType;
 use crate::role::NodeRole;
 
+/// Fixed TDMA schedule used by the demo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdmaSchedule {
     pub schedule_version: u8,
@@ -20,6 +27,7 @@ pub struct TdmaSchedule {
 }
 
 impl TdmaSchedule {
+    /// Default eight-slot demo superframe.
     pub const DEMO: Self = Self {
         schedule_version: 1,
         superframe_ms: 8_000,
@@ -37,23 +45,28 @@ impl TdmaSchedule {
         quiet_slot: 7,
     };
 
+    /// Slot number active at `gateway_time_ms`.
     pub const fn slot_at(self, gateway_time_ms: u64) -> u8 {
         ((gateway_time_ms % self.superframe_ms as u64) / self.slot_ms as u64) as u8
     }
 
+    /// Milliseconds elapsed inside the current slot.
     pub const fn slot_elapsed_ms(self, gateway_time_ms: u64) -> u32 {
         ((gateway_time_ms % self.superframe_ms as u64) % self.slot_ms as u64) as u32
     }
 
+    /// End of the usable transmit window within a slot.
     pub const fn active_end_ms(self) -> u32 {
         self.guard_before_ms + self.active_ms
     }
 
+    /// Whether `gateway_time_ms` is inside the non-guard transmit window.
     pub const fn is_active_window(self, gateway_time_ms: u64) -> bool {
         let elapsed = self.slot_elapsed_ms(gateway_time_ms);
         elapsed >= self.guard_before_ms && elapsed < self.active_end_ms()
     }
 
+    /// Delay from `gateway_time_ms` to the next slot boundary.
     pub const fn next_slot_delay_ms(self, gateway_time_ms: u64) -> u32 {
         self.slot_ms - self.slot_elapsed_ms(gateway_time_ms)
     }
@@ -77,6 +90,7 @@ impl TdmaSchedule {
     }
 }
 
+/// Smoothed offset from local monotonic time to gateway time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeSync {
     pub last_sync_seq: u16,
@@ -87,6 +101,7 @@ pub struct TimeSync {
 }
 
 impl TimeSync {
+    /// Create unsynced clock state for a node at `hop`.
     pub const fn new(hop: u8) -> Self {
         Self {
             last_sync_seq: 0,
@@ -97,6 +112,7 @@ impl TimeSync {
         }
     }
 
+    /// Apply a sync sample from a gateway-time frame.
     pub fn apply_sync(&mut self, sync_seq: u16, gateway_time_ms: u64, local_time_ms: u64) {
         let measured_offset = gateway_time_ms as i64 - local_time_ms as i64;
         self.offset_delta_ms = if self.last_sync_seq == 0 {
@@ -113,6 +129,7 @@ impl TimeSync {
         self.last_sync_seq = sync_seq;
     }
 
+    /// Convert local monotonic time to the current gateway-time estimate.
     pub const fn gateway_time_ms(self, local_time_ms: u64) -> u64 {
         if self.offset_ms >= 0 {
             local_time_ms.saturating_add(self.offset_ms as u64)

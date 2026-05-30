@@ -1,3 +1,8 @@
+//! Hardware-independent demo protocol state machine.
+//!
+//! This module owns frame construction, inbound frame application, join state,
+//! data sequence accounting, and alarm latching without depending on ESP HAL.
+
 use crate::{
     AppResult,
     protocol::{self, EncodedFrame, Frame, FrameType},
@@ -5,24 +10,31 @@ use crate::{
     tdma::{TdmaSchedule, TimeSync},
 };
 
+/// Join state for a demo node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkPhase {
+    /// Node is still bootstrapping and may send HELLO outside TDMA timing.
     Searching,
+    /// Node has accepted a JOIN_ACK and can participate in scheduled traffic
+    /// once its clock is synced.
     Joined,
 }
 
+/// Result of applying a received frame to a `DemoNode`.
+///
+/// The action is deliberately data-only so the hardware-bound task can decide
+/// whether to transmit, log, buffer, or ignore without duplicating protocol
+/// parsing logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameAction {
+    /// The frame was irrelevant, malformed, duplicated, or not actionable for
+    /// this node.
     Ignore,
-    Joined {
-        parent_id: u8,
-        hop: u8,
-        slot_id: u8,
-    },
-    Synced {
-        sync_seq: u16,
-        offset_ms: i64,
-    },
+    /// A JOIN_ACK was accepted and local topology state was updated.
+    Joined { parent_id: u8, hop: u8, slot_id: u8 },
+    /// A SYNC/SCHEDULE frame was accepted and the local clock was updated.
+    Synced { sync_seq: u16, offset_ms: i64 },
+    /// A DATA or ALARM payload was accepted.
     Data {
         origin_id: u8,
         origin_seq: u16,
@@ -30,30 +42,33 @@ pub enum FrameAction {
         humidity_centi_percent: u16,
         alarm: bool,
     },
+    /// An ACK payload was accepted.
     Ack {
         acked_seq: u16,
         acked_type: FrameType,
     },
-    Heartbeat {
-        slot_id: u8,
-        hop: u8,
-        sync_seq: u16,
-    },
+    /// A HEARTBEAT payload was accepted.
+    Heartbeat { slot_id: u8, hop: u8, sync_seq: u16 },
 }
 
+/// Hardware-independent protocol state for one demo node.
+///
+/// `DemoNode` owns role, topology, sequence counters, TDMA schedule, and clock
+/// sync state. Callers build outbound frames with the `make_*` methods and feed
+/// inbound frames through `apply_frame`.
 #[derive(Debug, Clone)]
 pub struct DemoNode {
-    pub role: NodeRole,
-    pub parent_id: Option<u8>,
-    pub hop: u8,
-    pub slot_id: u8,
-    pub seq: u16,
-    pub data_seq: u16,
-    pub heartbeat_seq: u16,
-    pub sync_seq: u16,
-    pub phase: NetworkPhase,
-    pub sync: TimeSync,
-    pub schedule: TdmaSchedule,
+    role: NodeRole,
+    parent_id: Option<u8>,
+    hop: u8,
+    slot_id: u8,
+    seq: u16,
+    data_seq: u16,
+    heartbeat_seq: u16,
+    sync_seq: u16,
+    phase: NetworkPhase,
+    sync: TimeSync,
+    schedule: TdmaSchedule,
     last_data_seq: Option<(u8, u16)>,
     last_heartbeat_seq: Option<(u8, u16)>,
 }
@@ -75,6 +90,51 @@ impl DemoNode {
             last_data_seq: None,
             last_heartbeat_seq: None,
         }
+    }
+
+    /// Static role selected for this node.
+    pub const fn role(&self) -> NodeRole {
+        self.role
+    }
+
+    /// Current parent node, if the node has a preferred parent.
+    pub const fn parent_id(&self) -> Option<u8> {
+        self.parent_id
+    }
+
+    /// Current routing hop count.
+    pub const fn hop(&self) -> u8 {
+        self.hop
+    }
+
+    /// TDMA data slot assigned to this node.
+    pub const fn slot_id(&self) -> u8 {
+        self.slot_id
+    }
+
+    /// Current join phase.
+    pub const fn phase(&self) -> NetworkPhase {
+        self.phase
+    }
+
+    /// Last sync sequence emitted or accepted by this node.
+    pub const fn sync_seq(&self) -> u16 {
+        self.sync_seq
+    }
+
+    /// Current TDMA schedule.
+    pub const fn schedule(&self) -> TdmaSchedule {
+        self.schedule
+    }
+
+    /// Current clock-sync state.
+    pub const fn sync(&self) -> TimeSync {
+        self.sync
+    }
+
+    /// Convert local monotonic time into the node's gateway time view.
+    pub const fn gateway_time_ms(&self, local_time_ms: u64) -> u64 {
+        self.sync.gateway_time_ms(local_time_ms)
     }
 
     pub fn mark_joined(&mut self) {
@@ -507,9 +567,9 @@ pub enum AlarmTransition {
 
 #[cfg(test)]
 mod tests {
-    use super::DemoNode;
+    use super::{DemoNode, FrameAction, NetworkPhase};
     use crate::protocol::{self, Frame, FrameType, Payload};
-    use crate::role::{BROADCAST_ID, DEMO_ZONE_ID, NET_ID, NodeRole};
+    use crate::role::{BROADCAST_ID, DEMO_ZONE_ID, GATEWAY_ID, NET_ID, NodeRole, RELAY_ID};
 
     fn frame(role: NodeRole, frame_type: FrameType, gateway_time_ms: u64) -> Frame {
         Frame {
@@ -597,5 +657,83 @@ mod tests {
 
         assert_eq!(data_origin_seq, 1);
         assert_eq!(alarm_origin_seq, 2);
+    }
+
+    #[test]
+    fn demo_nodes_join_sync_and_deliver_data_across_two_hops() {
+        let mut gateway = DemoNode::new(NodeRole::Gateway);
+        let mut relay = DemoNode::new(NodeRole::Relay);
+        let mut sensor = DemoNode::new(NodeRole::Sensor);
+
+        gateway.mark_joined();
+
+        let relay_hello = relay.make_hello(100).unwrap();
+        let relay_join = gateway
+            .make_join_ack(relay_hello.src_id, relay_hello.node_role, 110)
+            .unwrap();
+        assert_eq!(
+            relay.apply_frame(&relay_join, 120),
+            FrameAction::Joined {
+                parent_id: GATEWAY_ID,
+                hop: 1,
+                slot_id: NodeRole::Relay.default_slot()
+            }
+        );
+        assert_eq!(relay.phase(), NetworkPhase::Joined);
+
+        let gateway_sync = gateway.make_sync(1_000).unwrap();
+        assert!(matches!(
+            relay.apply_frame(&gateway_sync, 1_020),
+            FrameAction::Synced { sync_seq: 1, .. }
+        ));
+        assert!(relay.is_synced());
+
+        let sensor_hello = sensor.make_hello(1_100).unwrap();
+        let sensor_join = relay
+            .make_join_ack(sensor_hello.src_id, sensor_hello.node_role, 1_110)
+            .unwrap();
+        assert_eq!(
+            sensor.apply_frame(&sensor_join, 1_120),
+            FrameAction::Joined {
+                parent_id: RELAY_ID,
+                hop: 2,
+                slot_id: NodeRole::Sensor.default_slot()
+            }
+        );
+
+        let forwarded_sync = relay
+            .make_forwarded(&gateway_sync, BROADCAST_ID, 1_200)
+            .unwrap();
+        assert!(matches!(
+            sensor.apply_frame(&forwarded_sync, 1_220),
+            FrameAction::Synced { sync_seq: 1, .. }
+        ));
+        assert!(sensor.is_synced());
+
+        let sensor_data = sensor.make_data(2_300, 2_650, 6_700).unwrap();
+        assert_eq!(
+            relay.apply_frame(&sensor_data, 2_310),
+            FrameAction::Data {
+                origin_id: NodeRole::Sensor.node_id(),
+                origin_seq: 1,
+                temp_centi_c: 2_650,
+                humidity_centi_percent: 6_700,
+                alarm: false,
+            }
+        );
+
+        let forwarded_data = relay
+            .make_forwarded(&sensor_data, GATEWAY_ID, 3_300)
+            .unwrap();
+        assert_eq!(
+            gateway.apply_frame(&forwarded_data, 3_310),
+            FrameAction::Data {
+                origin_id: NodeRole::Sensor.node_id(),
+                origin_seq: 1,
+                temp_centi_c: 2_650,
+                humidity_centi_percent: 6_700,
+                alarm: false,
+            }
+        );
     }
 }

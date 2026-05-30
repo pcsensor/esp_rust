@@ -1,3 +1,5 @@
+//! Firmware entry point and async task wiring for the LoRa demo nodes.
+
 #![no_std]
 #![no_main]
 
@@ -176,11 +178,11 @@ async fn core_task(
                 let bytes = lora_tx.send_frame(&frame).await?;
                 println!(
                     "{} searching: send {} seq={} bytes={} parent={:?}",
-                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes, node.parent_id
+                    ACTIVE_ROLE, frame.frame_type, frame.seq, bytes, node.parent_id()
                 );
                 println!(
                     "{} searching: preferred_parent={:?} hop={} slot={}",
-                    ACTIVE_ROLE, node.parent_id, node.hop, node.slot_id
+                    ACTIVE_ROLE, node.parent_id(), node.hop(), node.slot_id()
                 );
             }
         }
@@ -196,15 +198,15 @@ async fn core_task(
             );
 
             let local_time_ms = elapsed_ms(boot);
-            let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
-            let slot = node.schedule.slot_at(gateway_time_ms);
+            let gateway_time_ms = node.sync().gateway_time_ms(local_time_ms);
+            let slot = node.schedule().slot_at(gateway_time_ms);
 
             #[cfg(feature = "gateway-node")]
             {
                 gateway_stats.update_sync(
-                    node.sync.last_sync_seq,
-                    node.sync.offset_ms,
-                    node.sync.offset_delta_ms,
+                    node.sync().last_sync_seq,
+                    node.sync().offset_ms,
+                    node.sync().offset_delta_ms,
                 );
                 if gateway_stats.should_report(gateway_time_ms) {
                     demo_log::print_gateway_stats(&gateway_stats, gateway_time_ms);
@@ -213,7 +215,7 @@ async fn core_task(
             }
 
             let follow_schedule = node.is_synced()
-                && (node.role == NodeRole::Gateway || node.phase == NetworkPhase::Joined);
+                && (node.role() == NodeRole::Gateway || node.phase() == NetworkPhase::Joined);
 
             enum CoreWake {
                 Frame(Frame),
@@ -224,7 +226,7 @@ async fn core_task(
 
             let wait_ms = if follow_schedule {
                 tx_window_delay_ms(&node, gateway_time_ms, slot, last_tx_slot)
-            } else if node.phase == NetworkPhase::Searching
+            } else if node.phase() == NetworkPhase::Searching
                 && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
             {
                 (last_hello_ms + HELLO_RETRY_INTERVAL_MS).saturating_sub(local_time_ms)
@@ -301,7 +303,7 @@ async fn core_task(
 
             if !follow_schedule {
                 let local_time_ms = elapsed_ms(boot);
-                if node.phase == NetworkPhase::Searching
+                if node.phase() == NetworkPhase::Searching
                     && matches!(ACTIVE_ROLE, NodeRole::Relay | NodeRole::Sensor)
                     && local_time_ms.saturating_sub(last_hello_ms) >= HELLO_RETRY_INTERVAL_MS
                 {
@@ -317,11 +319,11 @@ async fn core_task(
             }
 
             let local_time_ms = elapsed_ms(boot);
-            let gateway_time_ms = node.sync.gateway_time_ms(local_time_ms);
-            if !node.schedule.is_active_window(gateway_time_ms) {
+            let gateway_time_ms = node.sync().gateway_time_ms(local_time_ms);
+            if !node.schedule().is_active_window(gateway_time_ms) {
                 continue;
             }
-            let slot = node.schedule.slot_at(gateway_time_ms);
+            let slot = node.schedule().slot_at(gateway_time_ms);
             if last_tx_slot == Some(slot) {
                 continue;
             }
@@ -329,17 +331,17 @@ async fn core_task(
 
             {
                 match ACTIVE_ROLE {
-                    NodeRole::Gateway if slot == node.schedule.sync_slot => {
+                    NodeRole::Gateway if slot == node.schedule().sync_slot => {
                         let frame = node.make_sync(local_time_ms)?;
                         let bytes = lora_tx.send_frame(&frame).await?;
                         println!(
                             "tx {} frame_seq={} sync_seq={} schedule_v={} active={}ms guard_before={}ms gateway_time={} slot={} bytes={}",
                             frame.frame_type,
                             frame.seq,
-                            node.sync_seq,
-                            node.schedule.schedule_version,
-                            node.schedule.active_ms,
-                            node.schedule.guard_before_ms,
+                            node.sync_seq(),
+                            node.schedule().schedule_version,
+                            node.schedule().active_ms,
+                            node.schedule().guard_before_ms,
                             frame.gateway_time_ms,
                             slot,
                             bytes
@@ -353,8 +355,8 @@ async fn core_task(
                         }
                     }
                     NodeRole::Relay | NodeRole::Sensor
-                        if node.phase == NetworkPhase::Joined
-                            && slot == node.schedule.alarm_retry_slot =>
+                        if node.phase() == NetworkPhase::Joined
+                            && slot == node.schedule().alarm_retry_slot =>
                     {
                         if let Some((frame, attempt)) = pending_ack.next_retry(local_time_ms) {
                             let bytes = lora_tx.send_frame(&frame).await?;
@@ -375,8 +377,8 @@ async fn core_task(
                         }
                     }
                     NodeRole::Relay
-                        if node.phase == NetworkPhase::Joined
-                            && slot == node.schedule.relay_control_slot =>
+                        if node.phase() == NetworkPhase::Joined
+                            && slot == node.schedule().relay_control_slot =>
                     {
                         if let Some(sync_frame) = pending_sync_forward.take() {
                             let forwarded = node.make_forwarded(
@@ -387,54 +389,42 @@ async fn core_task(
                             let bytes = lora_tx.send_frame(&forwarded).await?;
                             println!(
                                 "relay control slot: forward SYNC sync_seq={} offset_ms={} drift={}ms bytes={}",
-                                node.sync.last_sync_seq,
-                                node.sync.offset_ms,
-                                node.sync.offset_delta_ms,
+                                node.sync().last_sync_seq,
+                                node.sync().offset_ms,
+                                node.sync().offset_delta_ms,
                                 bytes
                             );
                         }
                     }
                     NodeRole::Relay
-                        if node.phase == NetworkPhase::Joined
-                            && slot == node.schedule.relay_heartbeat_slot =>
+                        if node.phase() == NetworkPhase::Joined
+                            && slot == node.schedule().relay_heartbeat_slot =>
                     {
-                        let frame = node.make_heartbeat(local_time_ms)?;
-                        let bytes = lora_tx.send_frame(&frame).await?;
-                        println!(
-                            "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
-                            ACTIVE_ROLE,
-                            frame.seq,
-                            node.parent_id,
-                            node.slot_id,
-                            node.schedule.relay_heartbeat_slot,
-                            node.sync.last_sync_seq,
-                            node.sync.offset_ms,
-                            node.sync.offset_delta_ms,
-                            bytes
-                        );
+                        let heartbeat_slot = node.schedule().relay_heartbeat_slot;
+                        transmit_heartbeat(
+                            &mut lora_tx,
+                            &mut node,
+                            local_time_ms,
+                            heartbeat_slot,
+                        )
+                        .await?;
                     }
                     NodeRole::Sensor
-                        if node.phase == NetworkPhase::Joined
-                            && slot == node.schedule.sensor_heartbeat_slot =>
+                        if node.phase() == NetworkPhase::Joined
+                            && slot == node.schedule().sensor_heartbeat_slot =>
                     {
-                        let frame = node.make_heartbeat(local_time_ms)?;
-                        let bytes = lora_tx.send_frame(&frame).await?;
-                        println!(
-                            "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
-                            ACTIVE_ROLE,
-                            frame.seq,
-                            node.parent_id,
-                            node.slot_id,
-                            node.schedule.sensor_heartbeat_slot,
-                            node.sync.last_sync_seq,
-                            node.sync.offset_ms,
-                            node.sync.offset_delta_ms,
-                            bytes
-                        );
+                        let heartbeat_slot = node.schedule().sensor_heartbeat_slot;
+                        transmit_heartbeat(
+                            &mut lora_tx,
+                            &mut node,
+                            local_time_ms,
+                            heartbeat_slot,
+                        )
+                        .await?;
                     }
                     #[cfg(feature = "sensor-node")]
                     NodeRole::Sensor
-                        if node.phase == NetworkPhase::Joined && slot == node.schedule.sensor_slot =>
+                        if node.phase() == NetworkPhase::Joined && slot == node.schedule().sensor_slot =>
                     {
                         take_latest_sensor_sample(&mut latest_sensor_sample);
 
@@ -463,7 +453,7 @@ async fn core_task(
                             "tx {} seq={} parent={:?} temp={}.{:02}C humidity={}.{:02}% gateway_time={} bytes={}",
                             frame.frame_type,
                             frame.seq,
-                            node.parent_id,
+                            node.parent_id(),
                             sample.temp_centi_c / 100,
                             sample.temp_centi_c.unsigned_abs() % 100,
                             sample.humidity_centi_percent / 100,
@@ -473,7 +463,7 @@ async fn core_task(
                         );
                     }
                     NodeRole::Relay
-                        if node.phase == NetworkPhase::Joined && slot == node.schedule.relay_slot =>
+                        if node.phase() == NetworkPhase::Joined && slot == node.schedule().relay_slot =>
                     {
                         if let Some(alarm_frame) = pending_alarm_forward.take() {
                             let forwarded =
@@ -511,19 +501,19 @@ async fn core_task(
                             "relay slot active: buffered_data={} pending_ack={} parent={:?} hop={} sync_seq={} offset_ms={} offset_delta={}ms",
                             relay_forward.has_pending(),
                             pending_ack.has_pending(),
-                            node.parent_id,
-                            node.hop,
-                            node.sync.last_sync_seq,
-                            node.sync.offset_ms,
-                            node.sync.offset_delta_ms
+                            node.parent_id(),
+                            node.hop(),
+                            node.sync().last_sync_seq,
+                            node.sync().offset_ms,
+                            node.sync().offset_delta_ms
                         );
                     }
-                    NodeRole::Gateway if slot == node.schedule.alarm_retry_slot => {}
-                    NodeRole::Relay if slot == node.schedule.alarm_retry_slot => {}
-                    NodeRole::Sensor if slot == node.schedule.alarm_retry_slot => {}
-                    NodeRole::Gateway if slot == node.schedule.quiet_slot => {}
-                    NodeRole::Relay if slot == node.schedule.quiet_slot => {}
-                    NodeRole::Sensor if slot == node.schedule.quiet_slot => {}
+                    NodeRole::Gateway if slot == node.schedule().alarm_retry_slot => {}
+                    NodeRole::Relay if slot == node.schedule().alarm_retry_slot => {}
+                    NodeRole::Sensor if slot == node.schedule().alarm_retry_slot => {}
+                    NodeRole::Gateway if slot == node.schedule().quiet_slot => {}
+                    NodeRole::Relay if slot == node.schedule().quiet_slot => {}
+                    NodeRole::Sensor if slot == node.schedule().quiet_slot => {}
                     _ => {}
                 }
             }
@@ -670,15 +660,15 @@ fn tx_window_delay_ms(
     last_tx_slot: Option<u8>,
 ) -> u64 {
     if last_tx_slot == Some(slot) {
-        return node.schedule.next_slot_delay_ms(gateway_time_ms) as u64;
+        return node.schedule().next_slot_delay_ms(gateway_time_ms) as u64;
     }
-    let elapsed = node.schedule.slot_elapsed_ms(gateway_time_ms);
-    if elapsed < node.schedule.guard_before_ms {
-        (node.schedule.guard_before_ms - elapsed) as u64
-    } else if node.schedule.is_active_window(gateway_time_ms) {
+    let elapsed = node.schedule().slot_elapsed_ms(gateway_time_ms);
+    if elapsed < node.schedule().guard_before_ms {
+        (node.schedule().guard_before_ms - elapsed) as u64
+    } else if node.schedule().is_active_window(gateway_time_ms) {
         0
     } else {
-        node.schedule.next_slot_delay_ms(gateway_time_ms) as u64
+        node.schedule().next_slot_delay_ms(gateway_time_ms) as u64
     }
 }
 
@@ -698,6 +688,29 @@ async fn send_best_effort(
         bytes = lora_tx.send_frame(frame).await?;
     }
     Ok(bytes)
+}
+
+async fn transmit_heartbeat(
+    lora_tx: &mut LoraTx<'_>,
+    node: &mut DemoNode,
+    local_time_ms: u64,
+    heartbeat_slot: u8,
+) -> AppResult<()> {
+    let frame = node.make_heartbeat(local_time_ms)?;
+    let bytes = lora_tx.send_frame(&frame).await?;
+    println!(
+        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
+        ACTIVE_ROLE,
+        frame.seq,
+        node.parent_id(),
+        node.slot_id(),
+        heartbeat_slot,
+        node.sync().last_sync_seq,
+        node.sync().offset_ms,
+        node.sync().offset_delta_ms,
+        bytes
+    );
+    Ok(())
 }
 
 #[cfg(feature = "sensor-node")]
@@ -785,14 +798,14 @@ async fn handle_received_frame(
             "drop out-of-slot {} from {} claimed_slot={}",
             frame.frame_type,
             frame.src_id,
-            node.schedule.slot_at(frame.gateway_time_ms)
+            node.schedule().slot_at(frame.gateway_time_ms)
         );
         return Ok(());
     }
 
     let action = node.apply_frame(frame, local_time_ms);
 
-    match (node.role, frame.frame_type, action) {
+    match (node.role(), frame.frame_type, action) {
         (NodeRole::Gateway, FrameType::Hello, _) if frame.node_role == NodeRole::Relay => {
             let ack = node.make_join_ack(frame.src_id, frame.node_role, local_time_ms)?;
             let bytes = lora_tx.send_frame(&ack).await?;
@@ -898,7 +911,7 @@ async fn handle_received_frame(
             // Forward the HELLO to the gateway so it can log the topology
             let mut notify = frame.clone();
             notify.dst_id = GATEWAY_ID;
-            notify.hop = node.hop;
+            notify.hop = node.hop();
             let notify_bytes = lora_tx.send_frame(&notify).await?;
             println!(
                 "forward sensor HELLO to gateway: src={} hop={} bytes={}",
@@ -933,7 +946,10 @@ async fn handle_received_frame(
             *pending_sync_forward = Some(frame.clone());
             println!(
                 "rx {} sync_seq={} offset_ms={} drift={}ms -> queued for control slot",
-                frame.frame_type, sync_seq, offset_ms, node.sync.offset_delta_ms
+                frame.frame_type,
+                sync_seq,
+                offset_ms,
+                node.sync().offset_delta_ms
             );
         }
         (
@@ -1006,7 +1022,10 @@ async fn handle_received_frame(
         ) => {
             println!(
                 "rx {}: sync_seq={} offset_ms={} drift={}ms",
-                frame.frame_type, sync_seq, offset_ms, node.sync.offset_delta_ms
+                frame.frame_type,
+                sync_seq,
+                offset_ms,
+                node.sync().offset_delta_ms
             );
         }
         (

@@ -1,3 +1,9 @@
+//! Compact binary wire protocol shared by every demo node.
+//!
+//! Frames are intentionally fixed-layout up to the bounded payload. This keeps
+//! encode/decode deterministic on `no_std` targets and lets the UART stream
+//! decoder resynchronize after byte loss or noisy input.
+
 use core::fmt;
 use heapless::Vec;
 
@@ -16,6 +22,7 @@ pub type Payload = Vec<u8, MAX_PAYLOAD_LEN>;
 pub type EncodedFrame = Vec<u8, MAX_FRAME_LEN>;
 pub type RxBuffer = Vec<u8, RX_BUFFER_LEN>;
 
+/// Application frame kind carried in the wire header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
@@ -64,6 +71,10 @@ impl fmt::Display for FrameType {
     }
 }
 
+/// Decoded protocol frame.
+///
+/// `payload` is interpreted according to `frame_type` by the payload helpers in
+/// this module. The frame can be encoded directly for LoRa UART transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub net_id: u16,
@@ -150,6 +161,7 @@ impl Frame {
     }
 }
 
+/// Failure while serializing a frame or payload into a bounded buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
     FrameTooLong,
@@ -165,6 +177,7 @@ impl fmt::Display for EncodeError {
     }
 }
 
+/// Failure while validating a complete frame buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     TooShort,
@@ -192,6 +205,11 @@ impl fmt::Display for DecodeError {
     }
 }
 
+/// Incremental decoder for a noisy byte stream.
+///
+/// Bytes can arrive in arbitrary chunks. `next_frame` returns complete frames
+/// one at a time and discards invalid prefixes so the stream can resynchronize
+/// after corrupted bytes, bad CRCs, or partial frames.
 #[derive(Debug, Default)]
 pub struct FrameStreamDecoder {
     buffer: RxBuffer,
@@ -283,6 +301,7 @@ impl FrameStreamDecoder {
     }
 }
 
+/// Failure while feeding or draining the stream decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamDecodeError {
     BufferOverflow,
@@ -440,4 +459,113 @@ fn extend(out: &mut EncodedFrame, bytes: &[u8]) -> Result<(), EncodeError> {
 fn extend_payload(out: &mut Payload, bytes: &[u8]) -> Result<(), EncodeError> {
     out.extend_from_slice(bytes)
         .map_err(|_| EncodeError::PayloadTooLong)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::role::{DEMO_ZONE_ID, NET_ID, NodeRole, SENSOR_ID};
+
+    fn sample_frame(seq: u16) -> Frame {
+        Frame {
+            net_id: NET_ID,
+            src_id: SENSOR_ID,
+            dst_id: crate::role::RELAY_ID,
+            node_role: NodeRole::Sensor,
+            zone_id: DEMO_ZONE_ID,
+            frame_type: FrameType::Data,
+            seq,
+            hop: 2,
+            gateway_time_ms: 12_345,
+            payload: data_payload(SENSOR_ID, seq, 2_513, 6_481).unwrap(),
+        }
+    }
+
+    #[test]
+    fn frame_encode_decode_roundtrip_preserves_fields() {
+        let frame = sample_frame(7);
+        let encoded = frame.encode().unwrap();
+
+        assert_eq!(encoded[0], MAGIC);
+        assert_eq!(encoded[1], VERSION);
+        assert_eq!(encoded.len(), HEADER_LEN + frame.payload.len() + CRC_LEN);
+        assert_eq!(Frame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn decode_rejects_bad_crc() {
+        let mut encoded = sample_frame(1).encode().unwrap();
+        let payload_byte = HEADER_LEN;
+        encoded[payload_byte] ^= 0x55;
+
+        assert_eq!(Frame::decode(&encoded), Err(DecodeError::BadCrc));
+    }
+
+    #[test]
+    fn stream_decoder_waits_for_split_frame() {
+        let encoded = sample_frame(2).encode().unwrap();
+        let split_at = 8;
+        let mut decoder = FrameStreamDecoder::new();
+
+        decoder.push_bytes(&encoded[..split_at]).unwrap();
+        assert_eq!(decoder.next_frame().unwrap(), None);
+        assert_eq!(decoder.buffered_len(), split_at);
+
+        decoder.push_bytes(&encoded[split_at..]).unwrap();
+        assert_eq!(decoder.next_frame().unwrap(), Some(sample_frame(2)));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn stream_decoder_discards_noise_before_magic() {
+        let encoded = sample_frame(3).encode().unwrap();
+        let mut decoder = FrameStreamDecoder::new();
+
+        decoder.push_bytes(&[0, 1, 2, MAGIC - 1]).unwrap();
+        decoder.push_bytes(&encoded).unwrap();
+
+        assert_eq!(decoder.next_frame().unwrap(), Some(sample_frame(3)));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn stream_decoder_returns_sticky_frames_one_at_a_time() {
+        let first = sample_frame(4).encode().unwrap();
+        let second = sample_frame(5).encode().unwrap();
+        let mut decoder = FrameStreamDecoder::new();
+
+        decoder.push_bytes(&first).unwrap();
+        decoder.push_bytes(&second).unwrap();
+
+        assert_eq!(decoder.next_frame().unwrap(), Some(sample_frame(4)));
+        assert_eq!(decoder.next_frame().unwrap(), Some(sample_frame(5)));
+        assert_eq!(decoder.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn stream_decoder_resyncs_after_bad_crc() {
+        let mut bad = sample_frame(6).encode().unwrap();
+        let good = sample_frame(7).encode().unwrap();
+        let crc_byte = bad.len() - 1;
+        bad[crc_byte] ^= 0xaa;
+
+        let mut decoder = FrameStreamDecoder::new();
+        decoder.push_bytes(&bad).unwrap();
+        decoder.push_bytes(&good).unwrap();
+
+        assert_eq!(decoder.next_frame().unwrap(), Some(sample_frame(7)));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn stream_decoder_clears_buffer_on_overflow() {
+        let mut decoder = FrameStreamDecoder::new();
+        let bytes = [0x55; RX_BUFFER_LEN + 1];
+
+        assert_eq!(
+            decoder.push_bytes(&bytes),
+            Err(StreamDecodeError::BufferOverflow)
+        );
+        assert_eq!(decoder.buffered_len(), 0);
+    }
 }
