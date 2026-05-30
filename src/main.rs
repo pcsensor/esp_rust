@@ -31,7 +31,7 @@ use esp_println::{logger::init_logger_from_env, println};
 use esp32c3_rust::sensors::Sht40;
 use esp32c3_rust::{
     AppError, AppResult,
-    demo::{DemoNode, FrameAction, NetworkPhase},
+    demo::{DemoNode, FrameAction, GatewayHeartbeatState, NetworkPhase, RelayHeartbeatState},
     demo_log::{self, BuzzerAction, GatewayRxDataLog, GatewayStats},
     hardware::{LoraModuleConfigPlan, LoraUartConfig, PinConfig},
     protocol::{self, Frame, FrameType},
@@ -159,6 +159,8 @@ async fn core_task(
     mut pending_ack: PendingAck,
     mut relay_forward: RelayForwardBuffer,
     mut gateway_stats: GatewayStats,
+    mut relay_heartbeat: RelayHeartbeatState,
+    mut gateway_heartbeat: GatewayHeartbeatState,
     boot: Instant,
 ) {
     // Wrap the body in an async block so `?` propagates errors. The loop is
@@ -200,19 +202,6 @@ async fn core_task(
             let local_time_ms = elapsed_ms(boot);
             let gateway_time_ms = node.sync().gateway_time_ms(local_time_ms);
             let slot = node.schedule().slot_at(gateway_time_ms);
-
-            #[cfg(feature = "gateway-node")]
-            {
-                gateway_stats.update_sync(
-                    node.sync().last_sync_seq,
-                    node.sync().offset_ms,
-                    node.sync().offset_delta_ms,
-                );
-                if gateway_stats.should_report(gateway_time_ms) {
-                    demo_log::print_gateway_stats(&gateway_stats, gateway_time_ms);
-                    gateway_stats.mark_reported(gateway_time_ms);
-                }
-            }
 
             let follow_schedule = node.is_synced()
                 && (node.role() == NodeRole::Gateway || node.phase() == NetworkPhase::Joined);
@@ -284,6 +273,8 @@ async fn core_task(
                         &mut pending_sync_forward,
                         &mut pending_alarm_forward,
                         &mut gateway_stats,
+                        &mut relay_heartbeat,
+                        &mut gateway_heartbeat,
                     )
                     .await?;
                     continue;
@@ -334,6 +325,10 @@ async fn core_task(
                     NodeRole::Gateway if slot == node.schedule().sync_slot => {
                         let frame = node.make_sync(local_time_ms)?;
                         let bytes = lora_tx.send_frame(&frame).await?;
+                        println!();
+                        println!();
+                        println!();
+                        println!("====================superframe=======================");
                         println!(
                             "tx {} frame_seq={} sync_seq={} schedule_v={} active={}ms guard_before={}ms gateway_time={} slot={} bytes={}",
                             frame.frame_type,
@@ -346,6 +341,10 @@ async fn core_task(
                             slot,
                             bytes
                         );
+                        gateway_stats.mark_sync_sent(node.sync_seq());
+                        demo_log::print_gateway_stats(&gateway_stats, frame.gateway_time_ms);
+                        let status = gateway_heartbeat.status(frame.gateway_time_ms, node.schedule());
+                        demo_log::print_gateway_join_status(&status, frame.gateway_time_ms);
 
                         #[cfg(feature = "gateway-node")]
                         {
@@ -401,11 +400,14 @@ async fn core_task(
                             && slot == node.schedule().relay_heartbeat_slot =>
                     {
                         let heartbeat_slot = node.schedule().relay_heartbeat_slot;
+                        let presence_mask =
+                            relay_heartbeat.presence_mask(gateway_time_ms, node.schedule());
                         transmit_heartbeat(
                             &mut lora_tx,
                             &mut node,
                             local_time_ms,
                             heartbeat_slot,
+                            presence_mask,
                         )
                         .await?;
                     }
@@ -414,11 +416,13 @@ async fn core_task(
                             && slot == node.schedule().sensor_heartbeat_slot =>
                     {
                         let heartbeat_slot = node.schedule().sensor_heartbeat_slot;
+                        let presence_mask = protocol::heartbeat_presence_for_role(node.role());
                         transmit_heartbeat(
                             &mut lora_tx,
                             &mut node,
                             local_time_ms,
                             heartbeat_slot,
+                            presence_mask,
                         )
                         .await?;
                     }
@@ -625,6 +629,8 @@ async fn run(spawner: Spawner) -> AppResult<()> {
         PendingAck::new(),
         RelayForwardBuffer::new(),
         GatewayStats::new(),
+        RelayHeartbeatState::new(),
+        GatewayHeartbeatState::new(),
         Instant::now(),
     )
     .expect("core_task pool exhausted");
@@ -695,17 +701,19 @@ async fn transmit_heartbeat(
     node: &mut DemoNode,
     local_time_ms: u64,
     heartbeat_slot: u8,
+    presence_mask: u8,
 ) -> AppResult<()> {
-    let frame = node.make_heartbeat(local_time_ms)?;
+    let frame = node.make_heartbeat_with_presence(local_time_ms, presence_mask)?;
     let bytes = lora_tx.send_frame(&frame).await?;
     println!(
-        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} offset_ms={} drift={}ms bytes={}",
+        "{} tx HEARTBEAT seq={} parent={:?} data_slot={} heartbeat_slot={} sync_seq={} presence=0b{:08b} offset_ms={} drift={}ms bytes={}",
         ACTIVE_ROLE,
         frame.seq,
         node.parent_id(),
         node.slot_id(),
         heartbeat_slot,
         node.sync().last_sync_seq,
+        presence_mask,
         node.sync().offset_ms,
         node.sync().offset_delta_ms,
         bytes
@@ -785,6 +793,8 @@ async fn handle_received_frame(
     pending_sync_forward: &mut Option<Frame>,
     pending_alarm_forward: &mut Option<Frame>,
     gateway_stats: &mut GatewayStats,
+    relay_heartbeat: &mut RelayHeartbeatState,
+    gateway_heartbeat: &mut GatewayHeartbeatState,
 ) -> AppResult<()> {
     #[cfg(not(feature = "gateway-node"))]
     let _ = gateway_alarm_active;
@@ -872,6 +882,10 @@ async fn handle_received_frame(
 
             let origin_seq_gap =
                 gateway_stats.record_rx_data(frame.frame_type, origin_seq, ack_seq.is_some());
+            if frame.node_role == NodeRole::Relay && origin_id == NodeRole::Sensor.node_id() {
+                let now_ms = node.gateway_time_ms(local_time_ms);
+                let _ = gateway_heartbeat.record_relayed_sensor_frame(now_ms, node.schedule());
+            }
             demo_log::print_gateway_rx_data(&GatewayRxDataLog {
                 frame_type: frame.frame_type,
                 gateway_time_ms: frame.gateway_time_ms,
@@ -895,9 +909,18 @@ async fn handle_received_frame(
                 slot_id,
                 hop,
                 sync_seq,
+                presence_mask,
             },
         ) => {
-            demo_log::print_gateway_heartbeat(frame, slot_id, sync_seq);
+            demo_log::print_gateway_heartbeat(frame, slot_id, sync_seq, presence_mask);
+            if frame.node_role == NodeRole::Relay {
+                let now_ms = node.gateway_time_ms(local_time_ms);
+                let _ = gateway_heartbeat.record_relay_heartbeat(
+                    presence_mask,
+                    now_ms,
+                    node.schedule(),
+                );
+            }
             let _ = hop;
         }
         (NodeRole::Relay, FrameType::Hello, _) if frame.node_role == NodeRole::Sensor => {
@@ -925,11 +948,17 @@ async fn handle_received_frame(
                 slot_id,
                 hop,
                 sync_seq,
+                presence_mask,
             },
         ) => {
+            if frame.node_role == NodeRole::Sensor
+                && protocol::heartbeat_presence_contains(presence_mask, NodeRole::Sensor)
+            {
+                relay_heartbeat.record_sensor_seen(node.gateway_time_ms(local_time_ms));
+            }
             println!(
-                "rx HEARTBEAT from={} reported_data_slot={} hop={} sync_seq={}",
-                frame.src_id, slot_id, hop, sync_seq
+                "rx HEARTBEAT from={} reported_data_slot={} hop={} sync_seq={} presence=0b{:08b}",
+                frame.src_id, slot_id, hop, sync_seq, presence_mask
             );
         }
         (
@@ -963,6 +992,9 @@ async fn handle_received_frame(
                 alarm,
             },
         ) => {
+            if frame.node_role == NodeRole::Sensor && origin_id == NodeRole::Sensor.node_id() {
+                relay_heartbeat.record_sensor_seen(node.gateway_time_ms(local_time_ms));
+            }
             if alarm {
                 // First ALARM hop (sensor -> relay): ACK the sensor immediately
                 // so it stops retrying this hop, then buffer the ALARM for the

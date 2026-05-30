@@ -48,7 +48,12 @@ pub enum FrameAction {
         acked_type: FrameType,
     },
     /// A HEARTBEAT payload was accepted.
-    Heartbeat { slot_id: u8, hop: u8, sync_seq: u16 },
+    Heartbeat {
+        slot_id: u8,
+        hop: u8,
+        sync_seq: u16,
+        presence_mask: u8,
+    },
 }
 
 /// Hardware-independent protocol state for one demo node.
@@ -330,6 +335,17 @@ impl DemoNode {
     }
 
     pub fn make_heartbeat(&mut self, local_time_ms: u64) -> AppResult<Frame> {
+        self.make_heartbeat_with_presence(
+            local_time_ms,
+            protocol::heartbeat_presence_for_role(self.role),
+        )
+    }
+
+    pub fn make_heartbeat_with_presence(
+        &mut self,
+        local_time_ms: u64,
+        presence_mask: u8,
+    ) -> AppResult<Frame> {
         let seq = self.next_heartbeat_seq();
         Ok(Frame {
             net_id: NET_ID,
@@ -341,7 +357,12 @@ impl DemoNode {
             seq,
             hop: self.hop,
             gateway_time_ms: self.sync.gateway_time_ms(local_time_ms),
-            payload: protocol::heartbeat_payload(self.slot_id, self.hop, self.sync.last_sync_seq)?,
+            payload: protocol::heartbeat_payload(
+                self.slot_id,
+                self.hop,
+                self.sync.last_sync_seq,
+                presence_mask,
+            )?,
         })
     }
 
@@ -460,13 +481,14 @@ impl DemoNode {
                     return FrameAction::Ignore;
                 }
                 self.last_heartbeat_seq = Some(key);
-                if let Some((slot_id, hop, sync_seq)) =
+                if let Some((slot_id, hop, sync_seq, presence_mask)) =
                     protocol::decode_heartbeat_payload(&frame.payload)
                 {
                     FrameAction::Heartbeat {
                         slot_id,
                         hop,
                         sync_seq,
+                        presence_mask,
                     }
                 } else {
                     FrameAction::Ignore
@@ -565,11 +587,198 @@ pub enum AlarmTransition {
     Cleared,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayHeartbeatState {
+    sensor_last_seen_ms: Option<u64>,
+}
+
+impl RelayHeartbeatState {
+    pub const fn new() -> Self {
+        Self {
+            sensor_last_seen_ms: None,
+        }
+    }
+
+    pub fn record_sensor_seen(&mut self, now_ms: u64) {
+        self.sensor_last_seen_ms = Some(now_ms);
+    }
+
+    pub fn record_sensor_heartbeat(&mut self, now_ms: u64) {
+        self.record_sensor_seen(now_ms);
+    }
+
+    pub fn sensor_online(&self, now_ms: u64, schedule: TdmaSchedule) -> bool {
+        self.sensor_last_seen_ms.is_some_and(|last_seen| {
+            now_ms.saturating_sub(last_seen) <= heartbeat_timeout_ms(schedule)
+        })
+    }
+
+    pub fn presence_mask(&self, now_ms: u64, schedule: TdmaSchedule) -> u8 {
+        let mut mask = protocol::HEARTBEAT_PRESENCE_RELAY;
+        if self.sensor_online(now_ms, schedule) {
+            mask |= protocol::HEARTBEAT_PRESENCE_SENSOR;
+        }
+        mask
+    }
+}
+
+impl Default for RelayHeartbeatState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayNodeLiveness {
+    Online,
+    Offline,
+    Unknown,
+}
+
+impl GatewayNodeLiveness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Online => "ONLINE",
+            Self::Offline => "OFFLINE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayJoinStatus {
+    pub relay: GatewayNodeLiveness,
+    pub sensor: GatewayNodeLiveness,
+    pub relay_last_seen_ms: Option<u64>,
+    pub sensor_last_seen_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatewayJoinSnapshot {
+    relay: GatewayNodeLiveness,
+    sensor: GatewayNodeLiveness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayHeartbeatState {
+    relay_last_seen_ms: Option<u64>,
+    sensor_last_seen_ms: Option<u64>,
+    last_reported: GatewayJoinSnapshot,
+}
+
+impl GatewayHeartbeatState {
+    pub const fn new() -> Self {
+        Self {
+            relay_last_seen_ms: None,
+            sensor_last_seen_ms: None,
+            last_reported: GatewayJoinSnapshot {
+                relay: GatewayNodeLiveness::Offline,
+                sensor: GatewayNodeLiveness::Offline,
+            },
+        }
+    }
+
+    pub fn record_relay_heartbeat(
+        &mut self,
+        presence_mask: u8,
+        now_ms: u64,
+        schedule: TdmaSchedule,
+    ) -> Option<GatewayJoinStatus> {
+        if protocol::heartbeat_presence_contains(presence_mask, NodeRole::Relay) {
+            self.relay_last_seen_ms = Some(now_ms);
+        }
+        if protocol::heartbeat_presence_contains(presence_mask, NodeRole::Sensor) {
+            self.sensor_last_seen_ms = Some(now_ms);
+        }
+        self.take_status_change(now_ms, schedule)
+    }
+
+    pub fn record_relayed_sensor_frame(
+        &mut self,
+        now_ms: u64,
+        schedule: TdmaSchedule,
+    ) -> Option<GatewayJoinStatus> {
+        self.relay_last_seen_ms = Some(now_ms);
+        self.sensor_last_seen_ms = Some(now_ms);
+        self.take_status_change(now_ms, schedule)
+    }
+
+    pub fn poll_status_change(
+        &mut self,
+        now_ms: u64,
+        schedule: TdmaSchedule,
+    ) -> Option<GatewayJoinStatus> {
+        self.take_status_change(now_ms, schedule)
+    }
+
+    pub fn status(&self, now_ms: u64, schedule: TdmaSchedule) -> GatewayJoinStatus {
+        let timeout_ms = heartbeat_timeout_ms(schedule);
+        let relay_online = self
+            .relay_last_seen_ms
+            .is_some_and(|last_seen| now_ms.saturating_sub(last_seen) <= timeout_ms);
+        let sensor_recent = self
+            .sensor_last_seen_ms
+            .is_some_and(|last_seen| now_ms.saturating_sub(last_seen) <= timeout_ms);
+
+        let relay = if relay_online {
+            GatewayNodeLiveness::Online
+        } else {
+            GatewayNodeLiveness::Offline
+        };
+        let sensor = if sensor_recent && relay_online {
+            GatewayNodeLiveness::Online
+        } else if !relay_online && self.sensor_last_seen_ms.is_some() {
+            GatewayNodeLiveness::Unknown
+        } else {
+            GatewayNodeLiveness::Offline
+        };
+
+        GatewayJoinStatus {
+            relay,
+            sensor,
+            relay_last_seen_ms: self.relay_last_seen_ms,
+            sensor_last_seen_ms: self.sensor_last_seen_ms,
+        }
+    }
+
+    fn take_status_change(
+        &mut self,
+        now_ms: u64,
+        schedule: TdmaSchedule,
+    ) -> Option<GatewayJoinStatus> {
+        let status = self.status(now_ms, schedule);
+        let snapshot = GatewayJoinSnapshot {
+            relay: status.relay,
+            sensor: status.sensor,
+        };
+        if snapshot == self.last_reported {
+            None
+        } else {
+            self.last_reported = snapshot;
+            Some(status)
+        }
+    }
+}
+
+impl Default for GatewayHeartbeatState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub const fn heartbeat_timeout_ms(schedule: TdmaSchedule) -> u64 {
+    (schedule.superframe_ms as u64 * 2) + schedule.slot_ms as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DemoNode, FrameAction, NetworkPhase};
+    use super::{
+        DemoNode, FrameAction, GatewayHeartbeatState, GatewayNodeLiveness, NetworkPhase,
+        RelayHeartbeatState, heartbeat_timeout_ms,
+    };
     use crate::protocol::{self, Frame, FrameType, Payload};
     use crate::role::{BROADCAST_ID, DEMO_ZONE_ID, GATEWAY_ID, NET_ID, NodeRole, RELAY_ID};
+    use crate::tdma::TdmaSchedule;
 
     fn frame(role: NodeRole, frame_type: FrameType, gateway_time_ms: u64) -> Frame {
         Frame {
@@ -657,6 +866,97 @@ mod tests {
 
         assert_eq!(data_origin_seq, 1);
         assert_eq!(alarm_origin_seq, 2);
+    }
+
+    #[test]
+    fn heartbeat_action_includes_presence_mask() {
+        let mut sensor = DemoNode::new(NodeRole::Sensor);
+        let mut relay = DemoNode::new(NodeRole::Relay);
+        let heartbeat = sensor.make_heartbeat(1_000).unwrap();
+
+        assert_eq!(
+            relay.apply_frame(&heartbeat, 1_000),
+            FrameAction::Heartbeat {
+                slot_id: NodeRole::Sensor.default_slot(),
+                hop: NodeRole::Sensor.default_hop(),
+                sync_seq: 0,
+                presence_mask: protocol::HEARTBEAT_PRESENCE_SENSOR,
+            }
+        );
+    }
+
+    #[test]
+    fn relay_presence_reports_recent_sensor_only_until_timeout() {
+        let schedule = TdmaSchedule::DEMO;
+        let timeout_ms = heartbeat_timeout_ms(schedule);
+        let mut state = RelayHeartbeatState::new();
+
+        assert_eq!(
+            state.presence_mask(1_000, schedule),
+            protocol::HEARTBEAT_PRESENCE_RELAY
+        );
+
+        state.record_sensor_heartbeat(1_000);
+        assert_eq!(
+            state.presence_mask(1_000 + timeout_ms, schedule),
+            protocol::HEARTBEAT_PRESENCE_RELAY | protocol::HEARTBEAT_PRESENCE_SENSOR
+        );
+        assert_eq!(
+            state.presence_mask(1_000 + timeout_ms + 1, schedule),
+            protocol::HEARTBEAT_PRESENCE_RELAY
+        );
+    }
+
+    #[test]
+    fn gateway_presence_status_changes_on_heartbeat_and_timeout() {
+        let schedule = TdmaSchedule::DEMO;
+        let timeout_ms = heartbeat_timeout_ms(schedule);
+        let mut state = GatewayHeartbeatState::new();
+
+        let relay_online = state
+            .record_relay_heartbeat(protocol::HEARTBEAT_PRESENCE_RELAY, 1_000, schedule)
+            .unwrap();
+        assert_eq!(relay_online.relay, GatewayNodeLiveness::Online);
+        assert_eq!(relay_online.sensor, GatewayNodeLiveness::Offline);
+
+        let both_online = state
+            .record_relay_heartbeat(
+                protocol::HEARTBEAT_PRESENCE_RELAY | protocol::HEARTBEAT_PRESENCE_SENSOR,
+                2_000,
+                schedule,
+            )
+            .unwrap();
+        assert_eq!(both_online.relay, GatewayNodeLiveness::Online);
+        assert_eq!(both_online.sensor, GatewayNodeLiveness::Online);
+
+        let sensor_offline = state
+            .record_relay_heartbeat(
+                protocol::HEARTBEAT_PRESENCE_RELAY,
+                2_000 + timeout_ms + 1,
+                schedule,
+            )
+            .unwrap();
+        assert_eq!(sensor_offline.relay, GatewayNodeLiveness::Online);
+        assert_eq!(sensor_offline.sensor, GatewayNodeLiveness::Offline);
+
+        let relay_offline = state
+            .poll_status_change(2_000 + (timeout_ms * 2) + 2, schedule)
+            .unwrap();
+        assert_eq!(relay_offline.relay, GatewayNodeLiveness::Offline);
+        assert_eq!(relay_offline.sensor, GatewayNodeLiveness::Unknown);
+    }
+
+    #[test]
+    fn gateway_marks_relay_and_sensor_online_from_relayed_data() {
+        let schedule = TdmaSchedule::DEMO;
+        let mut state = GatewayHeartbeatState::new();
+
+        let status = state.record_relayed_sensor_frame(1_000, schedule).unwrap();
+
+        assert_eq!(status.relay, GatewayNodeLiveness::Online);
+        assert_eq!(status.sensor, GatewayNodeLiveness::Online);
+        assert_eq!(status.relay_last_seen_ms, Some(1_000));
+        assert_eq!(status.sensor_last_seen_ms, Some(1_000));
     }
 
     #[test]

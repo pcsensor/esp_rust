@@ -7,7 +7,7 @@
 use core::fmt;
 use heapless::Vec;
 
-use crate::role::NodeRole;
+use crate::role::{NodeRole, RELAY_ID, SENSOR_ID};
 
 pub const MAGIC: u8 = 0xc3;
 pub const VERSION: u8 = 1;
@@ -22,6 +22,9 @@ pub type Payload = Vec<u8, MAX_PAYLOAD_LEN>;
 pub type EncodedFrame = Vec<u8, MAX_FRAME_LEN>;
 pub type RxBuffer = Vec<u8, RX_BUFFER_LEN>;
 
+pub const HEARTBEAT_PRESENCE_RELAY: u8 = 1u8 << RELAY_ID;
+pub const HEARTBEAT_PRESENCE_SENSOR: u8 = 1u8 << SENSOR_ID;
+
 /// Application frame kind carried in the wire header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -34,6 +37,14 @@ pub enum FrameType {
     Alarm = 6,
     Ack = 7,
     Heartbeat = 8,
+}
+
+pub const fn heartbeat_presence_for_role(role: NodeRole) -> u8 {
+    1u8 << role.node_id()
+}
+
+pub const fn heartbeat_presence_contains(mask: u8, role: NodeRole) -> bool {
+    (mask & heartbeat_presence_for_role(role)) != 0
 }
 
 impl FrameType {
@@ -371,11 +382,17 @@ pub fn ack_payload(acked_seq: u16, acked_type: FrameType) -> Result<Payload, Enc
     Ok(payload)
 }
 
-pub fn heartbeat_payload(slot_id: u8, hop: u8, sync_seq: u16) -> Result<Payload, EncodeError> {
+pub fn heartbeat_payload(
+    slot_id: u8,
+    hop: u8,
+    sync_seq: u16,
+    presence_mask: u8,
+) -> Result<Payload, EncodeError> {
     let mut payload = Payload::new();
     push(&mut payload, slot_id)?;
     push(&mut payload, hop)?;
     extend_payload(&mut payload, &sync_seq.to_le_bytes())?;
+    push(&mut payload, presence_mask)?;
     Ok(payload)
 }
 
@@ -421,7 +438,7 @@ pub fn decode_ack_payload(payload: &[u8]) -> Option<(u16, FrameType)> {
     Some((acked_seq, acked_type))
 }
 
-pub fn decode_heartbeat_payload(payload: &[u8]) -> Option<(u8, u8, u16)> {
+pub fn decode_heartbeat_payload(payload: &[u8]) -> Option<(u8, u8, u16, u8)> {
     if payload.len() < 4 {
         return None;
     }
@@ -429,6 +446,7 @@ pub fn decode_heartbeat_payload(payload: &[u8]) -> Option<(u8, u8, u16)> {
         payload[0],
         payload[1],
         u16::from_le_bytes([payload[2], payload[3]]),
+        payload.get(4).copied().unwrap_or(0),
     ))
 }
 
@@ -567,5 +585,28 @@ mod tests {
             Err(StreamDecodeError::BufferOverflow)
         );
         assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn heartbeat_payload_carries_presence_mask() {
+        let payload = heartbeat_payload(5, 1, 42, HEARTBEAT_PRESENCE_RELAY).unwrap();
+
+        assert_eq!(
+            decode_heartbeat_payload(&payload),
+            Some((5, 1, 42, HEARTBEAT_PRESENCE_RELAY))
+        );
+        assert!(heartbeat_presence_contains(
+            HEARTBEAT_PRESENCE_RELAY,
+            NodeRole::Relay
+        ));
+        assert!(!heartbeat_presence_contains(
+            HEARTBEAT_PRESENCE_RELAY,
+            NodeRole::Sensor
+        ));
+    }
+
+    #[test]
+    fn heartbeat_payload_decoder_accepts_legacy_payload_without_presence() {
+        assert_eq!(decode_heartbeat_payload(&[6, 2, 7, 0]), Some((6, 2, 7, 0)));
     }
 }
