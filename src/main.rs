@@ -203,6 +203,14 @@ async fn core_task(
             let gateway_time_ms = node.sync().gateway_time_ms(local_time_ms);
             let slot = node.schedule().slot_at(gateway_time_ms);
 
+            if node.role() == NodeRole::Gateway {
+                if let Some(status) =
+                    gateway_heartbeat.poll_status_change(gateway_time_ms, node.schedule())
+                {
+                    demo_log::print_gateway_join_status(&status, gateway_time_ms);
+                }
+            }
+
             let follow_schedule = node.is_synced()
                 && (node.role() == NodeRole::Gateway || node.phase() == NetworkPhase::Joined);
 
@@ -884,7 +892,11 @@ async fn handle_received_frame(
                 gateway_stats.record_rx_data(frame.frame_type, origin_seq, ack_seq.is_some());
             if frame.node_role == NodeRole::Relay && origin_id == NodeRole::Sensor.node_id() {
                 let now_ms = node.gateway_time_ms(local_time_ms);
-                let _ = gateway_heartbeat.record_relayed_sensor_frame(now_ms, node.schedule());
+                if let Some(status) =
+                    gateway_heartbeat.record_relayed_sensor_frame(now_ms, node.schedule())
+                {
+                    demo_log::print_gateway_join_status(&status, now_ms);
+                }
             }
             demo_log::print_gateway_rx_data(&GatewayRxDataLog {
                 frame_type: frame.frame_type,
@@ -915,11 +927,11 @@ async fn handle_received_frame(
             demo_log::print_gateway_heartbeat(frame, slot_id, sync_seq, presence_mask);
             if frame.node_role == NodeRole::Relay {
                 let now_ms = node.gateway_time_ms(local_time_ms);
-                let _ = gateway_heartbeat.record_relay_heartbeat(
-                    presence_mask,
-                    now_ms,
-                    node.schedule(),
-                );
+                if let Some(status) =
+                    gateway_heartbeat.record_relay_heartbeat(presence_mask, now_ms, node.schedule())
+                {
+                    demo_log::print_gateway_join_status(&status, now_ms);
+                }
             }
             let _ = hop;
         }

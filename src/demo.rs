@@ -767,7 +767,7 @@ impl Default for GatewayHeartbeatState {
 }
 
 pub const fn heartbeat_timeout_ms(schedule: TdmaSchedule) -> u64 {
-    (schedule.superframe_ms as u64 * 2) + schedule.slot_ms as u64
+    schedule.superframe_ms as u64 + schedule.active_ms as u64
 }
 
 #[cfg(test)]
