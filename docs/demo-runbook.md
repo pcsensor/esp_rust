@@ -12,7 +12,7 @@ sensor-node -> relay-node -> gateway-node
 
 ## 预检查
 
-1. 确认三块 LoRa 模块参数一致（固件启动时会尝试通过 AT 命令关闭密钥；若模块没有响应 AT，会沿用已有透明传输配置继续运行）：
+1. 确认三块 LoRa 模块参数一致（固件启动时会尝试通过 AT 命令配置透明传输、串口、信道、速率、功率、分包、密钥、RSSI 和 LBT；若模块没有响应 AT，会沿用已有透明传输配置继续运行）：
    - 模块：DX-LR32-433T22D
    - 频段：433.15 MHz（信道 CHANNEL 00）
    - UART：9600 baud / 8N1
@@ -130,7 +130,7 @@ action      : buzzer OFF
 
 ```text
 --------------------------------------------------------------
-[NET STATS] uptime=00:04:00.000 rx_data=24 rx_alarm=2 tx_ack=2 origin_seq_gap_total=0 last_sync=34 offset=3ms drift=0ms
+[NET STATS] uptime=00:04:00.000 rx_data=24 rx_alarm=2 tx_ack=2 slot_violations=0 origin_seq_gap_total=0 last_sync=34 offset=3ms drift=0ms
 --------------------------------------------------------------
 ```
 
@@ -145,7 +145,8 @@ DX-LR32: exited AT mode, module rebooting
 role=relay node_id=2 default_slot=3 hop=1
 relay searching: send HELLO seq=... bytes=...
 rx JOIN_ACK: parent=1 hop=1 slot=3
-rx SYNC sync_seq=... offset_ms=... -> forward bytes=...
+rx SYNC sync_seq=... offset_ms=... drift=...ms -> queued for control slot
+relay control slot: forward SYNC sync_seq=... offset_ms=... drift=...ms bytes=...
 ```
 
 传感节点入网时：
@@ -160,13 +161,14 @@ forward sensor HELLO to gateway: src=3 hop=1 bytes=...
 ```text
 rx DATA origin=3 origin_seq=... from=3 temp=26.61C humidity=51.45% -> buffered_for_relay_slot
 relay slot active: buffered_data=... pending_ack=... parent=... hop=1 sync_seq=... offset_ms=... offset_delta=...ms
-relay slot tx buffered DATA sensor_seq=... relay_seq=... ack_required=false bytes=...
+relay slot tx buffered DATA origin_seq=... relay_seq=... ack_required=false bytes=...
 ```
 
 告警中继：
 
 ```text
-rx ALARM origin=3 origin_seq=... from=3 temp=31.20C humidity=85.00% alarm=true -> ack_bytes=... relay_seq=... immediate_forward_bytes=...
+rx ALARM origin=3 origin_seq=... from=3 temp=31.20C humidity=85.00% alarm=true -> ack_bytes=... queued_for_relay_slot
+relay slot tx ALARM origin_seq=... relay_seq=... ack_required=true bytes=...
 rx ACK from=1 acked_seq=... acked_type=ALARM cleared_pending=true
 ```
 
@@ -213,13 +215,14 @@ sensor alarm cleared: temp=28.90C humidity=70.00% clear_thresholds=2900cC/7500c%
 
 ## 已知边界
 
-- 固件启动时尝试通过 AT 命令关闭模块密钥（`AT+OPENKEY0`）；如果没有 `Entry AT` 响应，会保留现有透明模式配置继续演示。其余参数（信道、速率等级等）沿用模块出厂默认值或人工配置值。
+- 固件启动时尝试通过 AT 命令配置模块（包括 `AT+BAUD3`、`AT+PARI0`、`AT+MODE0`、`AT+LEVEL2`、`AT+SLEEP2`、`AT+SWITCH0`、`AT+CHANNEL00`、`AT+OPENKEY0`、`AT+PACKET1`、`AT+DRSSI0`、`AT+POWE22`、`AT+LBT0`）；如果没有 `Entry AT` 响应，会保留现有透明模式配置继续演示。
 - 当前可靠传输是单帧 `ALARM` pending-ACK 窗口（最多重传 3 次），普通 `DATA/HEARTBEAT` 是周期性最佳努力发送。
 - 超帧周期 8 s，每个 slot 1 s，共 8 个 slot；每个 slot 为 100 ms 前置 Guard、700 ms Active 发送窗口、200 ms 后置 Guard。现场可按 LoRa 空口延迟调整。
 - `sync_seq` 是独立同步序号，不等于普通 frame `seq`；ACK、DATA、HEARTBEAT 不会造成 `sync_seq` 跳号。
 - `SYNC` payload 会下发 `schedule_version`、`superframe_ms`、`slot_ms`、`guard_before_ms` 和 `active_ms`，中继和传感节点跟随网关调度参数。
 - `offset_delta` 是相邻两次 SYNC 测得 offset 的变化量，用于观察轻量时钟漂移补偿效果。
 - 告警使用回差：触发阈值为 30.00 C / 80.00%，解除阈值为 29.00 C / 75.00%。
+- 当前固件使用 Embassy 协作式多任务：RX 独立 `lora_rx_task` 通过 `read_async` 收帧，协议状态和 TX 由 `core_task` 独占，sensor/gateway 分别额外运行 `sensor_task`/`buzzer_task`。
 
 ## TDMA Slot 表
 
@@ -227,7 +230,7 @@ sensor alarm cleared: temp=28.90C humidity=70.00% clear_thresholds=2900cC/7500c%
 |---:|---|
 | 0 | 网关广播 `SYNC/SCHEDULE` |
 | 1 | 中继控制预留 |
-| 2 | 传感节点 `HELLO` 重试、采样、`DATA/ALARM` 首发 |
+| 2 | 传感节点 `HELLO` 重试、使用最新样本发送 `DATA/ALARM` 首发 |
 | 3 | 中继转发缓存的普通 `DATA` |
 | 4 | `ALARM` ACK 超时重传 |
 | 5 | 中继 `HEARTBEAT` |

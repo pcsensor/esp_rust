@@ -1,10 +1,14 @@
-# ESP32-C3 Rust Hello World
+# ESP32-C3 管廊传感网 Demo
 
-第一阶段目标：搭建 ESP32-C3 的 `esp-hal` + Embassy 项目骨架，并跑通 `hello world`。
+本仓库是一个基于 ESP32-C3、`esp-hal`、`esp-rtos` Embassy 集成和 DX-LR32-433T22D UART LoRa 模块的三节点管廊传感网答辩 demo。
 
-## 第二阶段：管廊传感网答辩 Demo
+演示拓扑固定为：
 
-当前代码已切到 `GOAL.md` 中的三节点 demo 工程骨架。三种固件角色通过 Cargo feature 选择，同一时间只能启用一个角色：
+```text
+sensor-node -> relay-node -> gateway-node
+```
+
+三种固件角色通过 Cargo feature 选择，同一时间只能启用一个角色：
 
 ```sh
 cargo check --release --no-default-features --features gateway-node
@@ -30,13 +34,13 @@ cargo run --release --no-default-features --features sensor-node
 ./scripts/run-release.sh sensor
 ```
 
-完整检查当前 demo 构建：
+完整检查当前 demo 构建、格式和脚本语法：
 
 ```sh
 ./scripts/check-demo.sh
 ```
 
-默认演示接线先按代码中的集中配置记录，实际接线确认后再调整：
+默认演示接线由 `src/hardware.rs` 集中配置：
 
 | 模块 | 默认 GPIO | 说明 |
 |---|---:|---|
@@ -54,14 +58,15 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 - 三节点固定演示拓扑：网关只接纳中继节点入网，中继只接纳传感节点入网，保证答辩时稳定展示 `sensor -> relay -> gateway`。
 - 简化 TDMA 参数：8 s 超帧、8 个 1 s slot；每个 slot 拆成 100 ms 前置 Guard、700 ms Active 发送窗口、200 ms 后置 Guard。
 - FTSP-like 时间同步状态：节点维护 `offset_ms`，收到 `SYNC` 后平滑更新；`sync_seq` 与普通 frame `seq` 分离，避免 ACK/DATA 导致同步序号跳号；日志打印 `offset_delta_ms` 用于观察轻量漂移补偿效果。
-- DX-LR32 UART transport：通过 UART1 发送编码后的帧。
-- LoRa UART 接收轮询：主循环使用 `read_ready()` 非阻塞检查串口；transport 内部带流式组帧缓存，可处理半帧、粘包和前导噪声字节。网关/中继/传感节点会按角色处理 `HELLO`、`JOIN_ACK`、`SYNC`、`DATA`、`ALARM`、`ACK`。
+- Embassy 多任务运行时：`lora_rx_task` 独占异步 UART RX 和流式解码器，`core_task` 独占 UART TX 与协议状态；sensor 构建额外运行 `sensor_task`，gateway 构建额外运行 `buzzer_task`。
+- DX-LR32 UART transport：启动时先用 Blocking UART 尝试 AT 配置，随后 `into_async().split()` 为 RX/TX 两半；RX 使用 `read_async` 中断驱动等待数据，不再使用 20 ms 轮询。
+- LoRa 接收流式组帧：可处理半帧、粘包和前导噪声字节。网关/中继/传感节点会按角色处理 `HELLO`、`JOIN_ACK`、`SYNC`、`DATA`、`ALARM`、`ACK`。
 - `DATA/ALARM` payload 携带 `origin_id` 和 `origin_seq`；中继转发后网关会以答辩演示日志打印原始传感节点序号、中继转发序号、温湿度、告警状态、ACK/蜂鸣器动作，便于判断丢包发生在哪一跳。
 - 在线心跳与确认：`DATA` 和 `HEARTBEAT` 为周期性最佳努力发送，不 ACK；`ALARM` 使用跳到跳 ACK，传感节点等中继 ACK，中继等网关 ACK，未确认时在告警重传 slot 最多重传 3 次。
-- SHT40 读取：传感节点通过 I2C0 读取温湿度，CRC8 校验失败或 I2C 失败时退回演示样本。
+- SHT40 读取：传感节点通过 I2C0 在 `sensor_task` 中按超帧节拍读取温湿度，CRC8 校验失败或 I2C 失败时退回演示样本。
 - 告警回差：温度 >= 30.00 C 或湿度 >= 80.00% 触发 `ALARM`；恢复到温度 < 29.00 C 且湿度 < 75.00% 后才解除，避免蜂鸣器在阈值附近抖动。
-- 网关蜂鸣器：GPIO10 默认高电平关闭；收到 `ALARM` 后拉低响铃，后续收到普通 `DATA` 时解除告警并关闭蜂鸣器。
-- 网关演示统计：每 30 s 打印 `rx_data`、`rx_alarm`、`tx_ack`、`origin_seq_gap_total`、`last_sync`、`offset` 和 `drift`，用于现场解释可靠性与时间同步状态。
+- 网关蜂鸣器：GPIO10 默认高电平关闭，由 `buzzer_task` 独占；收到 `ALARM` 后拉低响铃，后续收到普通 `DATA` 时解除告警并关闭蜂鸣器。
+- 网关演示统计：每 30 s 打印 `rx_data`、`rx_alarm`、`tx_ack`、`slot_violations`、`origin_seq_gap_total`、`last_sync`、`offset` 和 `drift`，用于现场解释可靠性与时间同步状态。
 
 当前 TDMA slot 分配：
 
@@ -69,7 +74,7 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 |---:|---:|---|
 | 0 | 0-1 s | 网关广播 `SYNC/SCHEDULE` |
 | 1 | 1-2 s | 中继控制预留，用于同步转发/入网控制扩展 |
-| 2 | 2-3 s | 传感节点 `HELLO` 重试、SHT40 采样和 `DATA/ALARM` 首发 |
+| 2 | 2-3 s | 传感节点 `HELLO` 重试、使用最新 SHT40 样本发送 `DATA/ALARM` 首发 |
 | 3 | 3-4 s | 中继向网关转发缓存的普通 `DATA` |
 | 4 | 4-5 s | `ALARM` ACK 超时后的重传 |
 | 5 | 5-6 s | 中继 `HEARTBEAT` |
@@ -78,11 +83,11 @@ LoRa 默认配置计划：模块 `DX-LR32-433T22D`，UART 9600 baud、433.15 MHz
 
 每个 slot 的发送规则：节点只在 Active 窗口内首发或重传，Guard 时间只接收不主动发送。网关会在 `SYNC` payload 中下发 `schedule_version`、`superframe_ms`、`slot_ms`、`guard_before_ms` 和 `active_ms`，中继和传感节点收到后跟随更新。
 
-当前仍需继续完成的部分：
+当前边界：
 
-- 中继转发、告警 ACK 和蜂鸣器联动已接入代码路径，仍需要三块板实测确认 DX-LR32 空口/串口时序、实际延迟和 1 s slot 长度。
 - 可靠传输当前是 demo 级单帧 ALARM pending-ACK 窗口；如果现场需要更高吞吐，再扩展为队列和按帧类型优先级调度。
 - DX-LR32 的运行时配置已集中到 `src/hardware.rs`，启动时显式固定 UART、透明传输、速率等级、工作模式、信道、分包、RSSI、功率、LBT 和密钥开关，并在启动日志中打印，便于人工核对。
+- ESP32-C3 是单核；Embassy 任务是协作式 async 调度，不是抢占式多线程。
 
 现场三节点联调步骤见 [docs/demo-runbook.md](docs/demo-runbook.md)。
 
@@ -184,7 +189,7 @@ target/riscv32imc-unknown-none-elf/release/esp32c3-rust
 
 ```toml
 [target.riscv32imc-unknown-none-elf]
-runner = "probe-rs run --chip ESP32-C3"
+runner = "probe-rs download --chip esp32c3"
 ```
 
 直接运行：
@@ -196,13 +201,13 @@ cargo run --release
 等效于：
 
 ```sh
-probe-rs run --chip ESP32-C3 target/riscv32imc-unknown-none-elf/release/esp32c3-rust
+probe-rs download --chip esp32c3 target/riscv32imc-unknown-none-elf/release/esp32c3-rust
 ```
 
 如需指定调试器：
 
 ```sh
-probe-rs run --chip ESP32-C3 --probe <VID:PID> target/riscv32imc-unknown-none-elf/release/esp32c3-rust
+probe-rs download --chip esp32c3 --probe <VID:PID> target/riscv32imc-unknown-none-elf/release/esp32c3-rust
 ```
 
 也可以使用项目脚本：
@@ -211,6 +216,12 @@ probe-rs run --chip ESP32-C3 --probe <VID:PID> target/riscv32imc-unknown-none-el
 ./scripts/run-release.sh gateway
 ./scripts/run-release.sh relay
 ./scripts/run-release.sh sensor
+```
+
+脚本会执行对应角色的 `cargo run`，然后调用 `probe-rs reset --chip esp32c3` 重启芯片。构建后查看日志可运行：
+
+```sh
+./scripts/monitor.sh
 ```
 
 ### 使用 espflash（备用）
